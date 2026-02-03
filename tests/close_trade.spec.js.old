@@ -1,0 +1,259 @@
+// tests/close_trade.spec.js
+// Script to close an open US500CASH position
+import { test } from '@playwright/test';
+
+test('Close US500CASH position', async ({ page }) => {
+  test.setTimeout(120000); // 2 minutes
+
+  const USER = 'namsom94@yahoo.de';
+  const PASS = 'Pitagoraa69!';
+
+  try {
+    // Login with robust handling
+    console.log('🔐 Logging in...');
+    await page.goto('https://avaoptions.avatrade.com/it/login');
+    await page.waitForTimeout(8000); // Give page time to load
+    
+    // Fill credentials
+    console.log('Filling username...');
+    await page.locator('input').first().click();
+    await page.locator('input').first().fill(USER);
+    
+    console.log('Filling password...');
+    await page.locator('input[type="password"]').first().click();
+    await page.locator('input[type="password"]').first().fill(PASS);
+    
+    await page.waitForTimeout(1000);
+    
+    console.log('Clicking login button...');
+    // Try multiple button selectors
+    const buttonSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]', 
+      'button:has-text("Login")',
+      'button:has-text("Accedi")',
+      'button:has-text("Sign in")',
+      'button:has-text("Log in")',
+      '[value="Login"]',
+      '[value="Accedi"]'
+    ];
+    
+    let buttonClicked = false;
+    for (const selector of buttonSelectors) {
+      try {
+        const button = page.locator(selector).first();
+        if (await button.count() > 0) {
+          await button.click();
+          console.log(`✓ Login button clicked with selector: ${selector}`);
+          buttonClicked = true;
+          break;
+        }
+      } catch (e) {
+        console.log(`Button selector ${selector} failed: ${e.message}`);
+      }
+    }
+    
+    if (!buttonClicked) {
+      console.log('Trying fallback button click...');
+      await page.locator('button').first().click();
+      console.log('✓ Fallback button clicked');
+    }
+
+    console.log('Waiting after login...');
+    await page.waitForTimeout(5000);
+    await page.screenshot({ path: 'after-login-close.png', fullPage: true });
+    
+    // Try to find and click account selection
+    console.log('Looking for account selection or continue...');
+    try {
+      const accountSelectors = [
+        'text=DEMO',
+        'text=REAL', 
+        'text=Practice',
+        'text=Live',
+        '[class*="account"]',
+        'button:has-text("Continue")',
+        'button:has-text("Continua")',
+        'button:has-text("Select")',
+        'button:has-text("Seleziona")'
+      ];
+      
+      let accountSelected = false;
+      for (const selector of accountSelectors) {
+        try {
+          const element = page.locator(selector).first();
+          if (await element.count() > 0) {
+            await element.click();
+            console.log(`✓ Clicked account/continue with selector: ${selector}`);
+            accountSelected = true;
+            break;
+          }
+        } catch (e) {
+          console.log(`Account selector ${selector} failed: ${e.message}`);
+        }
+      }
+      
+      if (!accountSelected) {
+        console.log('No specific account selector found, checking if we are already in trading interface...');
+      }
+    } catch (e) {
+      console.log('Account selection step skipped:', e.message);
+    }
+    
+    await page.waitForTimeout(5000);
+    await page.screenshot({ path: 'after-account-selection-close.png', fullPage: true });
+
+    // Wait for trading UI
+    console.log('Looking for trading interface...');
+    const tradingSelectors = [
+      'text=EUR/USD',
+      'text=EURUSD',
+      'text=US500CASH',
+      '[class*="instruments"]',
+      '[class*="trade"]',
+      '[class*="chart"]',
+      'text=USD/JPY',
+      'text=GBP/USD'
+    ];
+    
+    let tradingFound = false;
+    for (const selector of tradingSelectors) {
+      try {
+        await page.waitForSelector(selector, { timeout: 5000 });
+        console.log(`✓ Trading interface found with selector: ${selector}`);
+        tradingFound = true;
+        break;
+      } catch (e) {
+        console.log(`Trading selector ${selector} not found: ${e.message}`);
+      }
+    }
+    
+    if (!tradingFound) {
+      console.log('No specific trading elements found, continuing anyway...');
+      await page.waitForTimeout(3000);
+    }
+
+    // Check if US500CASH is already selected
+    console.log('🔍 Checking current instrument...');
+    await page.waitForTimeout(2000);
+    
+    const alreadySelected = await page.getByText('US500CASH').count() > 0;
+    if (alreadySelected) {
+      console.log('✓ US500CASH already selected');
+    } else {
+      console.log('⚠️  US500CASH not currently selected, but continuing to close position...');
+    }
+
+    // Navigate to open positions
+    console.log('\n📋 Opening positions panel...');
+    try {
+      // Try different variations of the positions text
+      const positionsSelectors = [
+        'text=posizioni aperte & ordini',
+        'text=Posizioni aperte & ordini',
+        'text=POSIZIONI APERTE & ORDINI',
+        'text=posizioni aperte',
+        'text=Posizioni aperte',
+        'text=/posizioni.*aperte/i',
+        'text=/open.*positions/i'
+      ];
+      
+      let positionsOpened = false;
+      for (const selector of positionsSelectors) {
+        try {
+          const element = page.locator(selector).first();
+          if (await element.count() > 0) {
+            await element.click();
+            console.log(`✓ Clicked positions panel with selector: ${selector}`);
+            positionsOpened = true;
+            break;
+          }
+        } catch (e) {
+          console.log(`Positions selector ${selector} failed: ${e.message}`);
+        }
+      }
+      
+      if (!positionsOpened) {
+        console.log('⚠️  Could not find positions panel with text, trying class-based selectors...');
+        await page.locator('[class*="position"]').first().click({ timeout: 3000 });
+        console.log('✓ Clicked positions panel (fallback)');
+      }
+    } catch (e) {
+      console.log('⚠️  Error opening positions panel:', e.message);
+    }
+    
+    await page.waitForTimeout(2000);
+    await page.screenshot({ path: 'positions-panel.png', fullPage: true });
+
+    // Find and click US500CASH position
+    console.log('🔍 Looking for US500CASH position...');
+    try {
+      await page.getByRole('cell', { name: 'US500CASH' }).click({ timeout: 5000 });
+      console.log('✓ Clicked US500CASH position');
+    } catch (e) {
+      console.log('⚠️  Could not find US500CASH cell, trying alternative selectors...');
+      // Try alternative ways to find the position
+      try {
+        await page.locator('td:has-text("US500CASH")').first().click({ timeout: 3000 });
+        console.log('✓ Clicked US500CASH position (fallback)');
+      } catch (e2) {
+        console.log('❌ Could not find US500CASH position:', e2.message);
+        throw new Error('US500CASH position not found');
+      }
+    }
+    
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: 'position-selected.png', fullPage: true });
+
+    // Click close position button
+    console.log('🚪 Closing position...');
+    try {
+      // Try multiple variations of the close button
+      const closeButtonSelectors = [
+        { name: 'Chiudi posizione' },
+        { name: /chiudi.*posizione/i },
+        { name: /close.*position/i },
+        { name: 'Chiudi' },
+        { name: 'Close' }
+      ];
+      
+      let positionClosed = false;
+      for (const selector of closeButtonSelectors) {
+        try {
+          await page.getByRole('button', selector).click({ timeout: 3000 });
+          console.log(`✓ Clicked close position button with selector: ${JSON.stringify(selector)}`);
+          positionClosed = true;
+          break;
+        } catch (e) {
+          console.log(`Close button selector ${JSON.stringify(selector)} failed: ${e.message}`);
+        }
+      }
+      
+      if (!positionClosed) {
+        console.log('⚠️  Could not find close button by role, trying text locator...');
+        await page.locator('button:has-text("Chiudi")').first().click({ timeout: 3000 });
+        console.log('✓ Clicked close button (fallback)');
+      }
+    } catch (e) {
+      console.log('❌ Error clicking close position button:', e.message);
+      throw new Error('Could not close position');
+    }
+    
+    // Wait for confirmation
+    await page.waitForTimeout(2000);
+    await page.screenshot({ path: 'position-closed.png', fullPage: true });
+    
+    console.log('✅ Position closed successfully!');
+
+    // Optional: Wait a bit more to see any confirmation messages
+    await page.waitForTimeout(3000);
+    await page.screenshot({ path: 'final-close-state.png', fullPage: true });
+
+    console.log('\n✅ Test completed - Position closed');
+
+  } catch (e) {
+    console.log('❌ Test error:', e.message);
+    await page.screenshot({ path: 'error-close.png', fullPage: true });
+    throw e;
+  }
+});
