@@ -10,38 +10,65 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
 
   // Inject stealth scripts to hide automation before navigating
   await page.addInitScript(() => {
-    // Override navigator.webdriver
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined
-    });
-    
-    // Override navigator properties to match Linux Chrome
-    Object.defineProperty(navigator, 'platform', {
-      get: () => 'Linux x86_64'
-    });
-    
-    // Override plugins to appear as normal browser
+    // Hide webdriver
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    delete navigator.__proto__.webdriver;
+
+    // Platform coerente con Chrome reale su Windows
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+
+    // Plugins realistici
     Object.defineProperty(navigator, 'plugins', {
-      get: () => [1, 2, 3, 4, 5]
+      get: () => {
+        const arr = [
+          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+          { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+          { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+        ];
+        arr.__proto__ = PluginArray.prototype;
+        return arr;
+      }
     });
-    
-    // Override languages
-    Object.defineProperty(navigator, 'languages', {
-      get: () => ['it-IT', 'it', 'en-US', 'en']
-    });
-    
-    // Chrome runtime
+
+    // Lingue realistiche
+    Object.defineProperty(navigator, 'languages', { get: () => ['it-IT', 'it', 'en-US', 'en'] });
+
+    // Hardware concurrency realistico
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+    // Chrome runtime completo (segnale forte di Chrome reale)
     window.chrome = {
-      runtime: {}
+      app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+      runtime: {
+        OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+        OnRestartRequiredReason: { APP_UPDATE: 'app_update', GC_PRESSURE: 'gc_pressure', OS_UPDATE: 'os_update' },
+        PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+        PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+        PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+        RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+        id: undefined,
+        connect: () => {},
+        sendMessage: () => {},
+      },
+      loadTimes: function() {},
+      csi: function() {},
     };
-    
-    // Permissions
+
+    // Permissions API
     const originalQuery = window.navigator.permissions.query;
     window.navigator.permissions.query = (parameters) => (
       parameters.name === 'notifications' ?
         Promise.resolve({ state: Notification.permission }) :
         originalQuery(parameters)
     );
+
+    // Nasconde cues di automation in outermostFrame
+    const getParam = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+    // Rimuovi flag cdp dal window
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
   });
 
   const USER = process.env.TRADE_USER;
@@ -52,6 +79,25 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
   const expiryDays = process.env.TRADE_EXPIRY_DAYS;
   const expiryTime = process.env.TRADE_EXPIRY_TIME;
   const accountType = process.env.TRADE_ACCOUNT_TYPE;
+  
+  // Client level wallet limits (from pricing tiers)
+  const levelWalletLimits = {
+    'Level I': 2000,
+    'Level II': 3500,
+    'Level III': 6000,
+    'Level IV': 10000,
+    'Level V': 16000,
+    'Level VI': 25000,
+    'Level VII': 40000,
+    'Level VIII': 65000,
+    'Level IX': 100000,
+    'Level X': 160000,
+    'Elite': 250000,
+    'Standard': Infinity
+  };
+  
+  const clientLevel = process.env.TRADE_CLIENT_LEVEL || 'Standard';
+  const maxWalletByLevel = levelWalletLimits[clientLevel] || Infinity;
   
   // Extract hour from time (e.g., "21:00:00" -> "21:00")
   const expiryHourMinute = expiryTime?.substring(0, 5) || '21:00'; // "21:00"
@@ -65,6 +111,10 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
   console.log(`   Target Strike: ${targetStrike}`);
   console.log(`   Expiry: ${expirySelector}`);
   console.log(`   Account Type: ${accountType || 'NOT SET - DEFAULTING TO DEMO'}`);
+  console.log(`   Client Level: ${clientLevel}`);
+  if (isFinite(maxWalletByLevel)) {
+    console.log(`   Max Wallet (Level): ${maxWalletByLevel}€`);
+  }
   console.log(`   User: ${USER}\n`);
   
   // Validate account type
@@ -78,10 +128,55 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     await page.goto('https://avaoptions.avatrade.com/it/login', { waitUntil: 'domcontentloaded' });
     console.log('✓ Page loaded, waiting for Cloudflare...');
     
-    // Wait longer for Cloudflare Turnstile to complete (15-20 seconds)
-    await page.waitForTimeout(15000);
-    console.log('✓ Cloudflare wait complete');
-    
+    // Smart CF wait: each iteration polls title AND tries to click the Turnstile checkbox
+    let cfPassed = false;
+    for (let cfWait = 0; cfWait < 18; cfWait++) {
+      try {
+        await page.waitForTimeout(5000);
+        const cfTitle = (await page.title()).toLowerCase();
+        console.log(`⏳ CF check (${(cfWait + 1) * 5}s): "${cfTitle}"`);
+        if (cfTitle !== '' && !cfTitle.includes('just a moment') && !cfTitle.includes('checking your') && !cfTitle.includes('please wait')) {
+          cfPassed = true;
+          console.log(`✓ Cloudflare resolved: "${cfTitle}"`);
+          break;
+        }
+        // CF still active — find Turnstile iframe and click the checkbox via raw mouse coords
+        const iframeBox = await page.evaluate(() => {
+          const iframes = Array.from(document.querySelectorAll('iframe'));
+          const cfIframe = iframes.find(f =>
+            (f.title && (f.title.includes('Widget') || f.title.includes('Cloudflare') || f.title.includes('challenge'))) ||
+            (f.src && (f.src.includes('challenges.cloudflare.com') || f.src.includes('turnstile')))
+          ) || iframes[0];
+          if (!cfIframe) return null;
+          const rect = cfIframe.getBoundingClientRect();
+          return { x: rect.left, y: rect.top, w: rect.width, h: rect.height };
+        });
+        if (iframeBox && iframeBox.w > 0) {
+          const cx = iframeBox.x + iframeBox.w * 0.15;
+          const cy = iframeBox.y + iframeBox.h * 0.5;
+          await page.mouse.move(300 + Math.random() * 200, 100 + Math.random() * 100, { steps: 15 });
+          await page.waitForTimeout(300 + Math.random() * 400);
+          await page.mouse.move(cx, cy, { steps: 10 });
+          await page.waitForTimeout(100 + Math.random() * 200);
+          await page.mouse.click(cx, cy);
+          console.log(`✓ Clicked Turnstile checkbox at (${Math.round(cx)}, ${Math.round(cy)})`);
+          await page.waitForTimeout(3000);
+        }
+      } catch (e) { /* page in transition */ }
+    }
+    console.log(cfPassed ? '✓ Cloudflare wait complete' : '⚠️  CF still active after 90s, proceeding...');
+
+    // Wait for actual login form elements - confirms we are past Cloudflare
+    console.log('⏳ Waiting for login form to appear...');
+    try {
+      await page.waitForSelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([disabled])', { timeout: 60000 });
+      console.log('✅ Login form is ready');
+    } catch (e) {
+      const currentTitle = await page.title().catch(() => 'unknown');
+      await page.screenshot({ path: getScreenshotPath('error-cf-blocking.png'), fullPage: true }).catch(() => {});
+      throw new Error(`Login form never appeared — Cloudflare still blocking? Title: "${currentTitle}"`);
+    }
+
     // Handle cookie consent banner if present
     console.log('Checking for cookie consent banner...');
     try {
@@ -294,36 +389,90 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     await page.screenshot({ path: getScreenshotPath('debug-margine-check.png'), fullPage: true });
     
     const allText = await page.locator('body').textContent();
-    const marginRequiredMatch = allText.match(/Margine\s+Richiesto[\s\S]{0,50}?([\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
-    
-    if (marginRequiredMatch) {
+
+    // ── PRIMARY CHECK: P/L Non Realizzato (IT) / Unrealized Profit (EN) ──
+    // Located in the top banner. Value is exactly 0,00 when no trade is open.
+    // Playwright codegen confirmed the element is in role=banner.
+    let unrealizedRawText = null;
+    try {
+      const banner = page.getByRole('banner');
+      // Try to grab the combined text node e.g. "P/L Non Realizzato0,00 CHF"
+      const unrealizedLabel = banner.locator('text=/P\\/L Non Realizzato|Unrealized Profit/i').first();
+      if (await unrealizedLabel.count() > 0) {
+        // Get the parent element that contains both label + value
+        const parentText = await unrealizedLabel.locator('..').textContent().catch(() => null)
+                        || await unrealizedLabel.textContent().catch(() => null);
+        unrealizedRawText = parentText;
+        console.log(`📊 Banner P/L element text: "${parentText?.trim()}"`);
+      }
+    } catch (e) {
+      console.log(`⚠️  Banner locator failed: ${e.message}`);
+    }
+
+    // Fallback: scan full body text if banner locator didn't work
+    const textToSearch = unrealizedRawText || allText;
+    const unrealizedValueMatch = textToSearch.match(/(?:P\/L\s+Non\s+Realizzato|Unrealized\s+Profit)[\s\S]{0,80}?(-?[\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
+    const unrealizedMatch = textToSearch.match(/P\/L\s+Non\s+Realizzato|Unrealized\s+Profit/i);
+
+    // ── SECONDARY CHECK: Margine Richiesto (IT) / Margin Required (EN) ──
+    const marginRequiredMatch = allText.match(/(?:Margine\s+Richiesto|Margin\s+Required)[\s\S]{0,50}?([\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
+
+    let tradeAlreadyOpen = false;
+    let detectionReason = '';
+
+    // Check P/L Non Realizzato first (most reliable)
+    if (unrealizedValueMatch) {
+      const rawValue = unrealizedValueMatch[1].replace(/\./g, '').replace(',', '.');
+      const unrealizedAmount = parseFloat(rawValue);
+      const currency = unrealizedValueMatch[2];
+      const formatted = `${unrealizedValueMatch[1]} ${currency}`;
+      console.log(`📊 P/L Non Realizzato: ${formatted}`);
+      if (unrealizedAmount !== 0) {
+        tradeAlreadyOpen = true;
+        detectionReason = `P/L Non Realizzato = ${formatted}`;
+      } else {
+        console.log('✅ P/L Non Realizzato = 0 - nessun trade aperto');
+      }
+    } else if (unrealizedMatch) {
+      // Field found but value not parsed - treat as unknown, fall through to secondary check
+      console.log('⚠️  P/L Non Realizzato trovato ma valore non leggibile');
+    } else {
+      console.log('⚠️  "P/L Non Realizzato" non trovato - verifico Margine Richiesto...');
+    }
+
+    // Secondary check: Margine Richiesto (used if primary check inconclusive)
+    if (!tradeAlreadyOpen && !unrealizedValueMatch && marginRequiredMatch) {
       const marginValue = marginRequiredMatch[1].replace(/\./g, '').replace(',', '.');
       const marginAmount = parseFloat(marginValue);
       const marginCurrency = marginRequiredMatch[2];
       const marginFormatted = `${marginRequiredMatch[1]} ${marginCurrency}`;
-      
       console.log(`📊 Margine Richiesto: ${marginFormatted}`);
-      
-      // If margin required > 0, there's already an open trade - ABORT IMMEDIATELY
       if (marginAmount > 0) {
-        console.log('');
-        console.log('╔════════════════════════════════════════════════════════╗');
-        console.log('║           ⚠️  TRADE GIÀ APERTO RILEVATO ⚠️            ║');
-        console.log('╠════════════════════════════════════════════════════════╣');
-        console.log(`║  Margine Richiesto: ${marginFormatted.padEnd(30)} ║`);
-        console.log('║  Non è possibile aprire un nuovo trade                ║');
-        console.log('║  mentre uno è già in corso                            ║');
-        console.log('╚════════════════════════════════════════════════════════╝');
-        console.log('');
-        await page.screenshot({ path: getScreenshotPath('trade-already-open.png'), fullPage: true });
-        
-        // CRITICAL: Throw error to completely stop execution
-        throw new Error(`🛑 TRADE ABORTED: Trade già aperto rilevato (Margine Richiesto = ${marginFormatted}). Impossibile aprire nuovo trade.`);
+        tradeAlreadyOpen = true;
+        detectionReason = `Margine Richiesto = ${marginFormatted}`;
       } else {
-        console.log('✅ Nessun trade aperto (Margine Richiesto = 0) - procedendo...');
+        console.log('✅ Margine Richiesto = 0 - nessun trade aperto');
       }
-    } else {
-      console.log('⚠️  "Margine Richiesto" non trovato - assumendo nessun trade aperto');
+    }
+
+    if (!unrealizedValueMatch && !marginRequiredMatch) {
+      console.log('⚠️  Nessun indicatore trovato - assumendo nessun trade aperto');
+    }
+
+    if (tradeAlreadyOpen) {
+      console.log('');
+      console.log('╔════════════════════════════════════════════════════════╗');
+      console.log('║           ⚠️  TRADE GIÀ APERTO RILEVATO ⚠️            ║');
+      console.log('╠════════════════════════════════════════════════════════╣');
+      console.log(`║  ${detectionReason.padEnd(52)} ║`);
+      console.log('║  Non è possibile aprire un nuovo trade                ║');
+      console.log('║  mentre uno è già in corso                            ║');
+      console.log('╚════════════════════════════════════════════════════════╝');
+      console.log('');
+      await page.screenshot({ path: getScreenshotPath('trade-already-open.png'), fullPage: true });
+
+      // CRITICAL: Throw error to completely stop execution
+      throw new Error(`🛑 TRADE ABORTED: Trade già aperto rilevato (${detectionReason}). Impossibile aprire nuovo trade.`);
     }
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -488,17 +637,25 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
             calculatedContracts = numberOfContracts;
           }
           
-          // Limit to max 1000 contracts (broker platform limitation)
-          // Use the calculated value as-is (floor already applied)
-          // If result is 0, it will be caught by final validation below
-          numberOfContracts = Math.min(calculatedContracts, 1000);
+          // Apply client level wallet limit
+          let maxContractsByLevel = Number.POSITIVE_INFINITY;
+          if (isFinite(maxWalletByLevel)) {
+            maxContractsByLevel = Math.floor(maxWalletByLevel / marginAmount);
+            if (calculatedContracts > maxContractsByLevel) {
+              console.log(`   ⚠️  Client Level "${clientLevel}" limits wallet to ${maxWalletByLevel}€`);
+              console.log(`   ⚠️  This allows max ${maxContractsByLevel} contracts @ ${marginPerContract}€ each`);
+            }
+          }
+          
+          // Use the calculated value, respecting both account balance and client level limits
+          numberOfContracts = Math.min(calculatedContracts, maxContractsByLevel);
         }
         
         console.log(`   📊 Account balance: ${cashBalance.amount} ${cashBalance.currency}`);
         console.log(`   💰 Margin per contract: ${marginPerContract} ${cashBalance.currency} (${marginSource})`);
         console.log(`   🧮 Calculation: floor((0.5 × ${cashBalance.amount}) / ${marginPerContract}) = ${calculatedContracts}`);
-        if (calculatedContracts > 1000) {
-          console.log(`   ⚠️  Calculated ${calculatedContracts} contracts, but limiting to 1000 (platform max)`);
+        if (isFinite(maxWalletByLevel)) {
+          console.log(`   📋 Client Level: ${clientLevel} (max wallet: ${maxWalletByLevel}€)`);
         }
         console.log(`   ✅ Final contracts: ${numberOfContracts}`);
         console.log('\n');
@@ -1290,11 +1447,34 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
 
     // Detect PUT handle using HSV color filter
     console.log('\n🎯 Detecting PUT handle...');
-    const detection = await detectPutHandle(page, { debugSave: true });
+    let detection = await detectPutHandle(page, { debugSave: true });
     
     if (!detection) {
-      console.log('❌ Could not detect PUT handle');
-      throw new Error('Detection failed');
+      console.log('⚠️  Could not detect PUT handle on first try - handle may be above viewport, scrolling up...');
+      
+      // Scroll up by the same amount normally used to scroll down, to bring the handle into view
+      const _viewportSize = page.viewportSize();
+      const _canvas = page.locator('canvas').first();
+      const _canvasBox = await _canvas.boundingBox();
+      const _scrollX = _canvasBox ? _canvasBox.x + _canvasBox.width / 2 : _viewportSize.width / 2;
+      const _scrollY = _canvasBox ? _canvasBox.y + _canvasBox.height / 2 : _viewportSize.height / 2;
+      
+      await page.mouse.move(_scrollX, _scrollY);
+      await page.waitForTimeout(200);
+      for (let i = 0; i < 3; i++) {
+        await page.mouse.wheel(0, -80); // Scroll up
+        await page.waitForTimeout(100);
+      }
+      await page.waitForTimeout(1500);
+      
+      console.log('🎯 Re-detecting PUT handle after scroll up...');
+      detection = await detectPutHandle(page, { debugSave: true });
+      
+      if (!detection) {
+        console.log('❌ Could not detect PUT handle even after scrolling up');
+        throw new Error('Detection failed');
+      }
+      console.log(`✅ PUT handle found at (${detection.x}, ${detection.y}) after scroll up`);
     }
 
     console.log(`✅ PUT handle found at (${detection.x}, ${detection.y})`);
@@ -1314,12 +1494,14 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     // Iterative drag loop to reach target strike
     const maxIterations = 30; // Increased from 20 to allow more attempts for larger strike movements
     const dragDistance = 150; // pixels per drag
-    const strikeThreshold = 0; // acceptable difference from target (set to 0 for exact match testing)
+    const strikeThreshold = 75; // acceptable difference from target (US500CASH moves in ~25-50pt increments; 75pt tolerance avoids abort on small overshoot)
     const scrollThreshold = 200; // pixels from bottom to trigger scroll
     const scrollAmount = 300; // pixels to scroll down
     
     let iteration = 0;
     let previousStrike = currentStrike;
+    let lastDragPixels = dragDistance; // track drag used so we can compute pts/px ratio
+    let pointsPerPixel = null; // dynamically calibrated from observed movement
     
     console.log(`\n🔄 Starting iterative drag to reach target: ${targetStrike}`);
     
@@ -1436,6 +1618,12 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         // Update detection coordinates
         detection.x = redetection.x;
         detection.y = redetection.y;
+
+        // Reset pts/px calibration — scrolling changes the chart scale
+        if (pointsPerPixel !== null) {
+          console.log(`   🔄 Resetting pts/px calibration after scroll (was ${pointsPerPixel.toFixed(3)})`);
+          pointsPerPixel = null;
+        }
         
         // Extra wait to ensure UI is fully stable after scroll
         await page.waitForTimeout(500);
@@ -1486,7 +1674,48 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         
         if (diff < 0) {
           console.log(`⚠️  Overshot target! Current: ${currentIterationStrike}, Target: ${targetStrike}`);
-          break;
+          // Try to recover by dragging UP a small amount
+          const overshootAmt = Math.abs(diff);
+          if (overshootAmt <= strikeThreshold) {
+            console.log(`   ✅ Overshoot within threshold (${overshootAmt}pts ≤ ${strikeThreshold}pts), accepting`);
+            break;
+          }
+          // Calculate how many px to drag up (use calibrated ratio or fallback)
+          const recoverPts = overshootAmt;
+          const recoverPx = pointsPerPixel ? Math.max(5, Math.round((recoverPts / pointsPerPixel) * 0.7)) : Math.max(5, Math.round(recoverPts / 2));
+          console.log(`   🔼 Attempting recovery drag UP by ${recoverPx}px to fix ${recoverPts}pt overshoot...`);
+          await page.keyboard.press('Escape').catch(() => {});
+          await page.waitForTimeout(200);
+          const recoverDetection = await detectPutHandle(page, { debugSave: false });
+          if (recoverDetection) {
+            await page.mouse.move(recoverDetection.x, recoverDetection.y, { steps: 5 });
+            await page.waitForTimeout(100);
+            await page.mouse.down();
+            await page.waitForTimeout(300);
+            const rSteps = 20;
+            for (let ri = 1; ri <= rSteps; ri++) {
+              await page.mouse.move(recoverDetection.x, recoverDetection.y - (recoverPx * ri / rSteps));
+              await page.waitForTimeout(10);
+            }
+            await page.waitForTimeout(200);
+            await page.mouse.up();
+            await page.waitForTimeout(1500);
+            lastDragPixels = recoverPx;
+            pointsPerPixel = null; // recalibrate after reverse drag
+            console.log(`   ✅ Recovery drag completed`);
+            // Reopen trading window so next iteration can read the strike
+            try {
+              await page.getByRole('button', { name: 'Vendi RCV' }).click({ timeout: 5000 });
+              await page.waitForTimeout(2000);
+              console.log(`   📊 Trading window re-opened after recovery`);
+            } catch {}
+            if (currentIterationStrike) previousStrike = currentIterationStrike;
+          } else {
+            console.log(`   ⚠️  Could not detect handle for recovery, stopping`);
+            break;
+          }
+          // Continue loop to re-read strike and check
+          continue;
         }
       }
       
@@ -1498,6 +1727,14 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
           break;
         }
         console.log(`   Change from previous: -${change.toFixed(2)} points`);
+
+        // Calibrate points-per-pixel ratio from observed movement
+        if (lastDragPixels > 0 && change > 0) {
+          const observed = change / lastDragPixels;
+          // Exponential moving average for stability
+          pointsPerPixel = pointsPerPixel === null ? observed : (pointsPerPixel * 0.6 + observed * 0.4);
+          console.log(`   📐 Calibrated pts/px: ${pointsPerPixel.toFixed(3)} (last drag: ${lastDragPixels}px → ${change.toFixed(0)}pts)`);
+        }
       }
       
       // Calculate adaptive drag distance based on distance to target
@@ -1506,17 +1743,24 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         const diff = currentIterationStrike - targetStrike;
         // Adaptive drag based on distance to target
         if (diff > 0) {
-          if (diff < 50) {
-            // Very close: tiny drag (30px)
-            adaptiveDragDistance = 30;
+          if (pointsPerPixel && pointsPerPixel > 0 && diff < 200) {
+            // Use calibrated ratio: target 80% of the needed movement to deliberately undershoot slightly
+            const precisePx = Math.round((diff / pointsPerPixel) * 0.80);
+            adaptiveDragDistance = Math.max(10, Math.min(precisePx, 100));
+            console.log(`🎯 Precise drag (${diff.toFixed(0)}pts away @ ${pointsPerPixel.toFixed(2)}pts/px): ${adaptiveDragDistance}px`);
+          } else if (diff < 25) {
+            adaptiveDragDistance = 10;
+            console.log(`🎯 Very close to target (${diff.toFixed(0)} points away), micro drag to ${adaptiveDragDistance}px`);
+          } else if (diff < 50) {
+            adaptiveDragDistance = 15;
             console.log(`🎯 Very close to target (${diff.toFixed(0)} points away), micro drag to ${adaptiveDragDistance}px`);
           } else if (diff < 100) {
-            // Close: small drag (50px)
-            adaptiveDragDistance = 50;
+            // Close: small drag (25px)
+            adaptiveDragDistance = 25;
             console.log(`🎯 Close to target (${diff.toFixed(0)} points away), reducing drag to ${adaptiveDragDistance}px`);
           } else if (diff < 200) {
-            // Approaching: medium drag (75px)
-            adaptiveDragDistance = 75;
+            // Approaching: medium drag (60px)
+            adaptiveDragDistance = 60;
             console.log(`🎯 Approaching target (${diff.toFixed(0)} points away), reducing drag to ${adaptiveDragDistance}px`);
           }
         }
@@ -1527,6 +1771,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       const startY = detection.y;
       const endY = startY + adaptiveDragDistance;
       
+      lastDragPixels = adaptiveDragDistance;
       console.log(`🖱️  Dragging PUT handle DOWN (${adaptiveDragDistance}px)...`);
       console.log(`   From: (${startX}, ${startY}) → To: (${startX}, ${endY})`);
       
@@ -1680,8 +1925,8 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     // Check 3: Contract quantity verification
     console.log(`\n3️⃣  Contract Quantity Verification:`);
     console.log(`   Contracts: ${numberOfContracts}`);
-    if (numberOfContracts < 1 || numberOfContracts > 1000) {
-      console.log(`   ❌ FAIL - Invalid contract quantity (must be 1-1000)`);
+    if (numberOfContracts < 1) {
+      console.log(`   ❌ FAIL - Invalid contract quantity (must be >= 1)`);
       shouldExecute = false;
     } else {
       console.log(`   ✅ PASS - Contract quantity valid`);
@@ -1736,29 +1981,64 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     console.log('📸 Order execution screenshot saved');
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // ✅ MANDATORY POST-EXECUTION VERIFICATION
+    // ✅ MANDATORY POST-EXECUTION VERIFICATION (with retry/backoff)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // This is REQUIRED to confirm trade execution. Without this check,
     // we cannot be sure the trade was actually opened on the broker side.
+    // The broker UI may take several seconds to update the margin field.
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    console.log('\n🔍 MANDATORY VERIFICATION: Reading Margine Richiesto...');
+    console.log('\n🔍 MANDATORY VERIFICATION: Reading Margine Richiesto (with retries)...');
     console.log('   ℹ️  This check is REQUIRED to confirm trade execution');
-    await page.waitForTimeout(3000); // Give UI time to update balance/margin
+    console.log('   ℹ️  Will retry multiple times if margin is still 0 (UI may be slow)');
     
-    const postExecText = await page.locator('body').textContent();
-    const postExecMarginMatch = postExecText.match(/Margine\s+Richiesto[\s\S]{0,50}?([\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
+    const maxAttempts = 6; // total attempts
+    const baseDelay = 3000; // initial delay in ms (3s, 6s, 9s, 12s, 15s, 18s)
+    let postMarginAmount = null;
+    let postMarginCurrency = null;
+    let postMarginFormatted = null;
+    let lastReadError = null;
     
-    if (!postExecMarginMatch) {
-      console.error('❌ CRITICAL ERROR: Cannot read Margine Richiesto after execution');
-      console.error('   Unable to verify if trade was opened');
-      await page.screenshot({ path: getScreenshotPath('margine-not-found.png'), fullPage: true });
-      throw new Error('❌ TRADE VERIFICATION FAILED: Cannot read Margine Richiesto field');
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const waitMs = baseDelay * attempt; // increasing backoff: 3s, 6s, 9s...
+      console.log(`   Attempt ${attempt}/${maxAttempts}: waiting ${waitMs}ms before reading margin`);
+      await page.waitForTimeout(waitMs);
+      await page.screenshot({ path: getScreenshotPath(`debug-margin-post-exec-attempt-${attempt}.png`), fullPage: true });
+      
+      try {
+        const postExecText = await page.locator('body').textContent();
+        const postExecMarginMatch = postExecText.match(/Margine\s+Richiesto[\s\S]{0,50}?([\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
+        
+        if (postExecMarginMatch) {
+          const postMarginValue = postExecMarginMatch[1].replace(/\./g, '').replace(',', '.');
+          postMarginAmount = parseFloat(postMarginValue);
+          postMarginCurrency = postExecMarginMatch[2];
+          postMarginFormatted = `${postExecMarginMatch[1]} ${postMarginCurrency}`;
+          
+          console.log(`   Read Margine Richiesto: ${postMarginFormatted}`);
+          
+          if (postMarginAmount > 0) {
+            console.log('   ✅ Margin > 0 → trade execution confirmed!');
+            break;
+          } else {
+            console.log('   ⏳ Margin is still 0, UI may not have updated yet, will retry...');
+          }
+        } else {
+          console.log('   ⚠️  Could not find Margine Richiesto in page text, will retry...');
+        }
+      } catch (readErr) {
+        lastReadError = readErr;
+        console.log(`   ⚠️  Error reading page text: ${readErr.message}, will retry...`);
+      }
     }
     
-    const postMarginValue = postExecMarginMatch[1].replace(/\./g, '').replace(',', '.');
-    const postMarginAmount = parseFloat(postMarginValue);
-    const postMarginCurrency = postExecMarginMatch[2];
-    const postMarginFormatted = `${postExecMarginMatch[1]} ${postMarginCurrency}`;
+    // After all retries, check final result
+    if (postMarginAmount === null) {
+      console.error('❌ CRITICAL ERROR: Cannot read Margine Richiesto after execution (all retries failed)');
+      console.error('   Unable to verify if trade was opened');
+      if (lastReadError) console.error('   Last error:', lastReadError.message);
+      await page.screenshot({ path: getScreenshotPath('margine-not-found.png'), fullPage: true });
+      throw new Error('❌ TRADE VERIFICATION FAILED: Cannot read Margine Richiesto field after retries');
+    }
     
     console.log(`📊 Margine Richiesto post-esecuzione: ${postMarginFormatted}`);
     console.log('');
@@ -1772,6 +2052,32 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       console.log('║  Il segnale verrà cancellato dal database             ║');
       console.log('╚════════════════════════════════════════════════════════╝');
       console.log('');
+      
+      // Read initial P&L (Profit/Loss) after trade execution
+      console.log('💰 Reading initial P&L...');
+      await page.waitForTimeout(2000); // Wait for P&L to update
+      
+      try {
+        const plText = await page.locator('body').textContent();
+        // Match P/L field with various formats: "P/L: -123.45 CHF" or "P/L -123.45" or "P/L: 123.45"
+        const plMatch = plText.match(/P[\/\s]*L[\s:]*(-?[\d.,]+)\s*(CHF|EUR|USD|GBP)?/i);
+        
+        if (plMatch) {
+          const plValue = plMatch[1].replace(/\./g, '').replace(',', '.');
+          const plAmount = parseFloat(plValue);
+          const plCurrency = plMatch[2] || postMarginCurrency;
+          const plFormatted = `${plMatch[1]} ${plCurrency}`;
+          
+          console.log(`📊 P/L iniziale: ${plFormatted}`);
+          console.log(`💰 PL_INFO: ${plAmount}`); // For monitor to capture
+        } else {
+          console.log('⚠️  P/L non trovato, verrà aggiornato successivamente');
+          console.log('💰 PL_INFO: 0'); // Default to 0
+        }
+      } catch (plError) {
+        console.log('⚠️  Errore lettura P/L:', plError.message);
+        console.log('💰 PL_INFO: 0');
+      }
     } else {
       console.log('╔════════════════════════════════════════════════════════╗');
       console.log('║          ❌ TRADE EXECUTION FAILED ❌                 ║');

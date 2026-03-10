@@ -23,7 +23,7 @@ test('Close US500CASH position', async ({ page }) => {
   try {
     // Add stealth scripts to avoid bot detection
     await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'it'] });
       window.chrome = { runtime: {} };
@@ -34,10 +34,55 @@ test('Close US500CASH position', async ({ page }) => {
     await page.goto('https://avaoptions.avatrade.com/it/login', { waitUntil: 'domcontentloaded' });
     console.log('✓ Page loaded, waiting for Cloudflare...');
     
-    // Wait for Cloudflare Turnstile to complete
-    await page.waitForTimeout(15000);
-    console.log('✓ Cloudflare wait complete');
-    
+    // Smart CF wait: each iteration polls title AND tries to click the Turnstile checkbox
+    let cfPassed = false;
+    for (let cfWait = 0; cfWait < 18; cfWait++) {
+      try {
+        await page.waitForTimeout(5000);
+        const cfTitle = (await page.title()).toLowerCase();
+        console.log(`⏳ CF check (${(cfWait + 1) * 5}s): "${cfTitle}"`);
+        if (cfTitle !== '' && !cfTitle.includes('just a moment') && !cfTitle.includes('checking your') && !cfTitle.includes('please wait')) {
+          cfPassed = true;
+          console.log(`✓ Cloudflare resolved: "${cfTitle}"`);
+          break;
+        }
+        // CF still active — find Turnstile iframe and click the checkbox via raw mouse coords
+        const iframeBox = await page.evaluate(() => {
+          const iframes = Array.from(document.querySelectorAll('iframe'));
+          const cfIframe = iframes.find(f =>
+            (f.title && (f.title.includes('Widget') || f.title.includes('Cloudflare') || f.title.includes('challenge'))) ||
+            (f.src && (f.src.includes('challenges.cloudflare.com') || f.src.includes('turnstile')))
+          ) || iframes[0];
+          if (!cfIframe) return null;
+          const rect = cfIframe.getBoundingClientRect();
+          return { x: rect.left, y: rect.top, w: rect.width, h: rect.height };
+        });
+        if (iframeBox && iframeBox.w > 0) {
+          const cx = iframeBox.x + iframeBox.w * 0.15;
+          const cy = iframeBox.y + iframeBox.h * 0.5;
+          await page.mouse.move(cx - 50, cy - 30, { steps: 8 });
+          await page.waitForTimeout(300);
+          await page.mouse.move(cx, cy, { steps: 8 });
+          await page.waitForTimeout(150);
+          await page.mouse.click(cx, cy);
+          console.log(`✓ Clicked Turnstile checkbox at (${Math.round(cx)}, ${Math.round(cy)})`);
+          await page.waitForTimeout(3000);
+        }
+      } catch (e) { /* page in transition */ }
+    }
+    console.log(cfPassed ? '✓ Cloudflare wait complete' : '⚠️  CF still active after 90s, proceeding...');
+
+    // Wait for actual login form elements - confirms we are past Cloudflare
+    console.log('⏳ Waiting for login form to appear...');
+    try {
+      await page.waitForSelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):not([disabled])', { timeout: 60000 });
+      console.log('✅ Login form is ready');
+    } catch (e) {
+      const currentTitle = await page.title().catch(() => 'unknown');
+      await page.screenshot({ path: getScreenshotPath('error-cf-blocking.png'), fullPage: true }).catch(() => {});
+      throw new Error(`Login form never appeared — Cloudflare still blocking? Title: "${currentTitle}"`);
+    }
+
     // Handle cookie consent banner if present
     console.log('Checking for cookie consent banner...');
     try {
@@ -234,6 +279,109 @@ test('Close US500CASH position', async ({ page }) => {
     await page.screenshot({ path: getScreenshotPath('position-closed.png'), fullPage: true });
     
     console.log('✅ Position closed successfully!');
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🔍 CRITICAL VERIFICATION: Check Margine Richiesto = 0 with retry/backoff
+    // Some broker UIs update balances asynchronously; retry for up to ~30s before failing.
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.log('\n🔍 MANDATORY VERIFICATION: Checking Margine Richiesto = 0 (with retries)...');
+
+    const maxAttempts = 8; // total attempts
+    const baseDelay = 3000; // initial delay in ms
+    let marginAmount = null;
+    let marginCurrency = null;
+    let marginFormatted = null;
+    let lastMarginText = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const waitMs = baseDelay * attempt; // increasing backoff
+      console.log(`   Attempt ${attempt}/${maxAttempts}: waiting ${waitMs}ms before reading margin`);
+      await page.waitForTimeout(waitMs);
+      await page.screenshot({ path: getScreenshotPath(`debug-margin-post-close-attempt-${attempt}.png`), fullPage: true });
+
+      try {
+        const allText = await page.locator('body').textContent();
+        lastMarginText = allText;
+        const marginMatch = allText.match(/Margine\s+Richiesto[\s\S]{0,50}?([\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
+        if (marginMatch) {
+          const marginValueRaw = marginMatch[1];
+          const marginValueNum = parseFloat(marginValueRaw.replace(/\./g, '').replace(',', '.'));
+          marginAmount = marginValueNum;
+          marginCurrency = marginMatch[2];
+          marginFormatted = `${marginMatch[1]} ${marginCurrency}`;
+          console.log(`   Read Margine Richiesto: ${marginFormatted}`);
+          if (marginAmount === 0) {
+            console.log('   Margin is zero → closure confirmed');
+            break;
+          } else {
+            console.log('   Margin not zero yet, will retry...');
+          }
+        } else {
+          console.log('   Could not find Margine Richiesto in page text, will retry...');
+        }
+      } catch (readErr) {
+        console.log('   Error reading page text for margin:', readErr.message);
+      }
+    }
+
+    if (marginAmount === null) {
+      console.error('❌ CRITICAL ERROR: Cannot read Margine Richiesto after closure (all retries)');
+      await page.screenshot({ path: getScreenshotPath('error-no-margin-field.png'), fullPage: true });
+      throw new Error('❌ CLOSURE VERIFICATION FAILED: Cannot read Margine Richiesto field after retries');
+    }
+
+    console.log(`📊 Margine Richiesto post-chiusura (final read): ${marginFormatted}`);
+
+    if (marginAmount === 0) {
+      // SUCCESS: Trade successfully closed
+      console.log('');
+      console.log('╔════════════════════════════════════════════════════════╗');
+      console.log('║         ✅ CHIUSURA TRADE CONFERMATA ✅               ║');
+      console.log('╠════════════════════════════════════════════════════════╣');
+      console.log(`║  Margine Richiesto: ${marginFormatted.padEnd(30)} ║`);
+      console.log('║  La posizione è stata chiusa con successo             ║');
+      console.log('╚════════════════════════════════════════════════════════╝');
+      console.log('');
+      
+      // Read final P&L (Profit/Loss) after trade closure
+      console.log('💰 Reading final P/L after closure...');
+      await page.waitForTimeout(1000);
+      
+      try {
+        // Try to find P/L in the page - may be shown in a summary or final balance
+        const plMatch = allText.match(/P[\/\s]*L[\s:]*(-?[\d.,]+)\s*(CHF|EUR|USD|GBP)?/i);
+        
+        if (plMatch) {
+          const plValue = plMatch[1].replace(/\./g, '').replace(',', '.');
+          const plAmount = parseFloat(plValue);
+          const plCurrency = plMatch[2] || marginCurrency;
+          const plFormatted = `${plMatch[1]} ${plCurrency}`;
+          
+          console.log(`📊 P/L finale: ${plFormatted}`);
+          console.log(`💰 PL_FINAL_INFO: ${plAmount}`); // For monitor to capture
+        } else {
+          console.log('⚠️  P/L finale non trovato');
+          console.log('💰 PL_FINAL_INFO: 0');
+        }
+      } catch (plError) {
+        console.log('⚠️  Errore lettura P/L finale:', plError.message);
+        console.log('💰 PL_FINAL_INFO: 0');
+      }
+    } else {
+      // FAILURE: Trade still open after closure attempts
+      console.log('');
+      console.log('╔════════════════════════════════════════════════════════╗');
+      console.log('║         ❌ CHIUSURA TRADE FALLITA ❌                  ║');
+      console.log('╠════════════════════════════════════════════════════════╣');
+      console.log(`║  Margine Richiesto: ${marginFormatted.padEnd(30)} ║`);
+      console.log('║  La posizione è ancora aperta dopo il tentativo      ║');
+      console.log('║  di chiusura. Verificare manualmente.                ║');
+      console.log('╚════════════════════════════════════════════════════════╝');
+      console.log('');
+      await page.screenshot({ path: getScreenshotPath('closure-failed-margin-not-zero.png'), fullPage: true });
+      
+      throw new Error(`❌ CLOSURE EXECUTION FAILED: Margine Richiesto is still ${marginFormatted} after closure attempts. Trade NOT closed.`);
+    }
     
     // Note: Balance is not read in close_trade, will use null
     console.log('💰 BALANCE_INFO: null');
