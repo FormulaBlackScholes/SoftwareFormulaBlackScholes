@@ -1,0 +1,12 @@
+Copyright (c) 2026 Formula Black & Scholes. All rights reserved.
+
+This repository distributes official Formula Black & Scholes application releases and related documentation.
+The software is proprietary and confidential.
+
+No permission is granted to copy, modify, distribute, sublicense, sell, reverse engineer, decompile,
+disassemble, or create derivative works from the software, except as expressly permitted by a separate
+written agreement with the copyright holder.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, TO THE MAXIMUM EXTENT PERMITTED BY LAW.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
