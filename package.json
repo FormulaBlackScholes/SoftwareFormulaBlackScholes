@@ -1,7 +1,7 @@
 {
   "name": "avaauto",
-  "version": "1.0.50",
-  "description": "Automated trading for AvaOptions with database monitoring and web interface - v1.0.50",
+  "version": "1.4.0",
+  "description": "Automated trading for AvaOptions with database monitoring and web interface - v1.1.8",
   "type": "module",
   "main": "src/main.js",
   "scripts": {
@@ -9,7 +9,8 @@
     "start:dev": "node --watch src/main.js",
     "test": "playwright test",
     "test:headed": "playwright test --headed",
-    "test:debug": "playwright test --debug"
+    "test:debug": "playwright test --debug",
+    "build:desktop:linux": "cd electron-app && npm install && npm run build:desktop:linux"
   },
   "keywords": [
     "trading",

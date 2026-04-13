@@ -15,21 +15,46 @@ import { getScreenshotPath } from './paths.js';
  * @returns {Object|null} Detection result with x, y coordinates
  */
 export async function detectPutHandle(page, options = {}) {
-  const { debugSave = false } = options;
+  const { debugSave = (process.env.DEBUG_BROWSER === 'true') } = options;
   
   console.log('🎯 Detecting PUT handle using HSV color filtering...');
   
   try {
-    // Find canvas element
-    const canvas = page.locator('canvas').first();
-    const canvasBox = await canvas.boundingBox();
-    
-    if (!canvasBox) {
-      console.log('❌ Canvas not found');
-      return null;
+    // Try every canvas on the page — the PUT circle may be inside a dialog canvas,
+    // not in the first (main chart) canvas.
+    const allCanvases = page.locator('canvas');
+    const canvasCount = await allCanvases.count();
+    console.log(`🖼  Found ${canvasCount} canvas element(s) on page`);
+
+    for (let ci = 0; ci < canvasCount; ci++) {
+      const canvas = allCanvases.nth(ci);
+      const canvasBox = await canvas.boundingBox().catch(() => null);
+      if (!canvasBox || canvasBox.width < 50 || canvasBox.height < 50) continue;
+
+      console.log(`📐 Canvas[${ci}]: ${canvasBox.width}x${canvasBox.height} at (${canvasBox.x}, ${canvasBox.y})`);
+
+      const result = await _detectOnCanvas(page, canvasBox, ci, debugSave);
+      if (result) return result;
     }
-    
-    console.log(`📐 Canvas: ${canvasBox.width}x${canvasBox.height} at (${canvasBox.x}, ${canvasBox.y})`);
+
+    // Final fallback: scan the full page screenshot (use actual viewport size)
+    console.log('🔁 Falling back to full-page scan...');
+    const vp = page.viewportSize();
+    const fullBox = { x: 0, y: 0, width: vp ? vp.width : 1920, height: vp ? vp.height : 1080 };
+    const result = await _detectOnCanvas(page, fullBox, 'full', debugSave);
+    if (result) return result;
+
+    console.log('❌ No circular PUT handle detected on any canvas');
+    return null;
+
+  } catch (error) {
+    console.error('❌ Detection error:', error.message);
+    return null;
+  }
+}
+
+async function _detectOnCanvas(page, canvasBox, label, debugSave) {
+  try {
     
     // Take screenshot of canvas only
     const screenshotBuffer = await page.screenshot({
@@ -42,7 +67,7 @@ export async function detectPutHandle(page, options = {}) {
     });
     
     if (debugSave) {
-      const screenshotPath = getScreenshotPath('canvas-screenshot.png');
+      const screenshotPath = getScreenshotPath(`canvas-screenshot-${label}.png`);
       fs.writeFileSync(screenshotPath, screenshotBuffer);
       console.log(`💾 Saved: ${screenshotPath}`);
     }
@@ -51,7 +76,9 @@ export async function detectPutHandle(page, options = {}) {
     const image = sharp(screenshotBuffer);
     const { data, info } = await image.raw().toBuffer({ resolveWithObject: true });
     
-    console.log(`📊 Image: ${info.width}x${info.height}, ${info.channels} channels`);
+    // Compute device pixel ratio — page.screenshot returns device pixels but canvasBox is in CSS pixels
+    const dpr = info.width / canvasBox.width;
+    console.log(`📊 Canvas[${label}] image: ${info.width}x${info.height}, ${info.channels} channels (DPR: ${dpr.toFixed(2)})`);
     
     // Create a mask for visualization
     const width = info.width;
@@ -101,8 +128,7 @@ export async function detectPutHandle(page, options = {}) {
     }
     
     if (debugSave) {
-      // Save mask for debugging
-      const maskPath = getScreenshotPath('debug-mask.png');
+      const maskPath = getScreenshotPath(`debug-mask-${label}.png`);
       await sharp(maskData, {
         raw: { width, height, channels: 1 }
       }).toFile(maskPath);
@@ -146,14 +172,14 @@ export async function detectPutHandle(page, options = {}) {
         const key = `${x},${y}`;
         if (maskData[y * width + x] === 255 && !visited.has(key)) {
           const points = floodFill(x, y);
-          if (points.length >= 50) { // Minimum area
+          if (points.length >= 50) { // Minimum area (device pixels)
             contours.push(points);
           }
         }
       }
     }
     
-    console.log(`🔍 Found ${contours.length} red/orange regions`);
+    console.log(`🔍 Canvas[${label}]: Found ${contours.length} red/orange/white regions`);
     
     // Analyze each contour to find circles
     const candidates = [];
@@ -161,7 +187,7 @@ export async function detectPutHandle(page, options = {}) {
     for (const points of contours) {
       if (points.length < 50) continue;
       
-      // Calculate bounding box
+      // Calculate bounding box (device pixels)
       let minX = width, maxX = 0, minY = height, maxY = 0;
       for (const [x, y] of points) {
         minX = Math.min(minX, x);
@@ -173,8 +199,10 @@ export async function detectPutHandle(page, options = {}) {
       const bw = maxX - minX + 1;
       const bh = maxY - minY + 1;
       
-      // Filter by size
-      if (bw < 10 || bh < 10 || bw > 150 || bh > 150) continue;
+      // Filter by size in CSS pixels (divide device pixels by DPR)
+      const bw_css = bw / dpr;
+      const bh_css = bh / dpr;
+      if (bw_css < 10 || bh_css < 10 || bw_css > 150 || bh_css > 150) continue;
       
       // Check aspect ratio (circle-like)
       const aspectRatio = bw / bh;
@@ -187,18 +215,18 @@ export async function detectPutHandle(page, options = {}) {
       
       if (circularity < 0.3) continue;
       
-      // Calculate center (convert to page coordinates)
+      // Calculate center — divide device-pixel offsets by DPR to get CSS coordinates
       const centerX = minX + bw / 2;
       const centerY = minY + bh / 2;
       
       candidates.push({
-        x: Math.round(canvasBox.x + centerX),
-        y: Math.round(canvasBox.y + centerY),
+        x: Math.round(canvasBox.x + centerX / dpr),
+        y: Math.round(canvasBox.y + centerY / dpr),
         bbox: {
-          x: Math.round(canvasBox.x + minX),
-          y: Math.round(canvasBox.y + minY),
-          w: bw,
-          h: bh
+          x: Math.round(canvasBox.x + minX / dpr),
+          y: Math.round(canvasBox.y + minY / dpr),
+          w: Math.round(bw / dpr),
+          h: Math.round(bh / dpr)
         },
         confidence: Math.min(circularity, 1.0),
         area: area,
@@ -210,27 +238,36 @@ export async function detectPutHandle(page, options = {}) {
     candidates.sort((a, b) => b.confidence - a.confidence);
     
     if (candidates.length === 0) {
-      console.log('❌ No circular PUT handle detected');
+      console.log(`   Canvas[${label}]: no circular PUT handle found (${contours.length} regions checked)`);
+      // Always save the canvas screenshot when detection fails so the user can diagnose visually
+      const failPath = getScreenshotPath(`canvas-screenshot-${label}.png`);
+      if (!fs.existsSync(failPath)) {
+        fs.writeFileSync(failPath, screenshotBuffer);
+        console.log(`💾 Saved for diagnostics: ${failPath}`);
+      }
       return null;
     }
     
     const best = candidates[0];
-    console.log(`✅ PUT handle detected at (${best.x}, ${best.y})`);
+    console.log(`✅ PUT handle detected on canvas[${label}] at (${best.x}, ${best.y})`);
     console.log(`   • Confidence: ${(best.confidence * 100).toFixed(1)}%`);
     console.log(`   • Area: ${best.area} pixels`);
     console.log(`   • BBox: ${best.bbox.w}x${best.bbox.h}`);
     
     // Save annotated image
     if (debugSave) {
+      // SVG is drawn over the device-pixel screenshot, so convert CSS offsets back to device pixels
+      const dx = (best.x - canvasBox.x) * dpr;
+      const dy = (best.y - canvasBox.y) * dpr;
       const annotated = await sharp(screenshotBuffer)
         .composite([{
           input: Buffer.from(`
             <svg width="${info.width}" height="${info.height}">
-              <circle cx="${best.x - canvasBox.x}" cy="${best.y - canvasBox.y}" r="${best.bbox.w / 2}" 
+              <circle cx="${dx}" cy="${dy}" r="${best.bbox.w * dpr / 2}" 
                       stroke="lime" stroke-width="3" fill="none"/>
-              <circle cx="${best.x - canvasBox.x}" cy="${best.y - canvasBox.y}" r="5" 
+              <circle cx="${dx}" cy="${dy}" r="5" 
                       fill="red"/>
-              <text x="${best.x - canvasBox.x + 15}" y="${best.y - canvasBox.y - 10}" 
+              <text x="${dx + 15}" y="${dy - 10}" 
                     fill="lime" font-size="14" font-weight="bold">
                 HSV: ${(best.confidence * 100).toFixed(0)}%
               </text>
@@ -241,7 +278,7 @@ export async function detectPutHandle(page, options = {}) {
         }])
         .toBuffer();
       
-      const resultPath = getScreenshotPath('detection-result.png');
+      const resultPath = getScreenshotPath(`detection-result-${label}.png`);
       fs.writeFileSync(resultPath, annotated);
       console.log(`💾 Saved: ${resultPath}`);
     }
@@ -249,7 +286,7 @@ export async function detectPutHandle(page, options = {}) {
     return best;
     
   } catch (error) {
-    console.error('❌ Detection error:', error.message);
+    console.log(`   Canvas[${label}] error: ${error.message}`);
     return null;
   }
 }

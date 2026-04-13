@@ -81,6 +81,33 @@ test('Check Margine Richiesto', async ({ page }) => {
     }
     console.log(cfPassed ? '✓ Cloudflare wait complete' : '⚠️  CF still active after 90s, proceeding...');
 
+    // Handle cookie consent PAGE (appears as a redirect before login, not just a banner)
+    try {
+      const consentSelectors = [
+        'button:has-text("Accept all")',
+        'button:has-text("Accetta tutti")',
+        'button:has-text("Accept All")',
+        'button:has-text("Accept")',
+        'button:has-text("Accetta")',
+        '#onetrust-accept-btn-handler',
+        'button[id*="accept"]',
+        'button[class*="accept"]',
+        '.cookie-accept',
+        '[aria-label*="Accept"]',
+      ];
+      for (const sel of consentSelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 3000 })) {
+            await btn.click();
+            console.log(`✓ Cookie consent accepted (selector: ${sel})`);
+            await page.waitForTimeout(2000);
+            break;
+          }
+        } catch {}
+      }
+    } catch {}
+
     // Wait for actual login form elements - confirms we are past Cloudflare
     console.log('⏳ Waiting for login form to appear...');
     try {

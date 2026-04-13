@@ -9,11 +9,21 @@ console.log('📁 CF cookies path:', CF_COOKIES_FILE, '| exists:', fs.existsSync
 
 // Detect Chrome executable path - try standard locations, fallback to bundled Chromium
 function findChromePath() {
+  const linuxCandidates = [
+    process.env.CHROME_BIN,
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/snap/bin/chromium',
+  ].filter(Boolean);
+
   const candidates = [
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google\\Chrome\\Application\\chrome.exe') : null,
     process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, 'Google\\Chrome\\Application\\chrome.exe') : null,
+    ...linuxCandidates,
   ].filter(Boolean);
 
   for (const p of candidates) {
@@ -34,6 +44,12 @@ const chromePath = findChromePath();
 /** @type {import('@playwright/test').PlaywrightTestConfig} */
 const config = {
   testDir: './tests',
+  testIgnore: [
+    '**/electron-app/**',
+    '**/dist-packager/**',
+    '**/dist/**',
+    '**/node_modules/**',
+  ],
   timeout: 600000, // 10 minutes (increased for slow PCs and drag operations)
   fullyParallel: false,
   forbidOnly: false,
@@ -45,7 +61,9 @@ const config = {
   use: {
     // CRITICAL: headless: false required for Cloudflare Turnstile bypass on Windows
     headless: false,
-    viewport: { width: 1920, height: 1080 },
+    // In debug mode: null lets --start-maximized actually fill the screen.
+    // In production: fixed viewport keeps layout consistent for HSV detection.
+    viewport: process.env.DEBUG_BROWSER === 'true' ? null : { width: 1920, height: 1080 },
     screenshot: 'only-on-failure',
     video: 'off',
     trace: 'off',

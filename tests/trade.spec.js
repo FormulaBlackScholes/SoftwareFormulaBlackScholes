@@ -5,8 +5,74 @@ import { test } from '@playwright/test';
 import { detectPutHandle } from '../utils/hsvDetector.js';
 import { getScreenshotPath } from '../utils/paths.js';
 
+/**
+ * Normalize a raw number string to a JS float.
+ * Handles both locale formats:
+ *   Italian / Swiss: "1.234,56"  dot=thousands  comma=decimal
+ *   English:         "1,234.56"  comma=thousands dot=decimal
+ *   Plain:           "9.55" or "9,55"
+ */
+function parseLocalFloat(str) {
+  str = str.trim().replace(/\s/g, '');
+  if (!str) return NaN;
+  if (str.includes(',') && str.includes('.')) {
+    // Whichever separator comes last is the decimal separator
+    return str.lastIndexOf('.') > str.lastIndexOf(',')
+      ? parseFloat(str.replace(/,/g, ''))          // EN: 1,234.56
+      : parseFloat(str.replace(/\./g, '').replace(',', '.')); // IT: 1.234,56
+  }
+  if (str.includes(',')) return parseFloat(str.replace(',', '.')); // IT: 9,55
+  return parseFloat(str); // already EN dot-decimal or plain integer
+}
+
+/**
+ * Parse a currency+amount pair near a label in raw page text.
+ * Handles all AvaTrade UI formats:
+ *   Italian text code,  number first:  "-12,34 CHF"
+ *   English text code, currency first: "CHF -12.34"
+ *   Euro symbol before number:         "€690.25" / "-€9.55" / "€-9.55"
+ *   Euro symbol after number:          "-9,55 €"
+ *   Same for $ and £
+ * @param {string} text - raw page text to search in
+ * @param {RegExp} labelPattern - regex that matches the field label
+ * @returns {{ amount: number, currency: string, formatted: string } | null}
+ */
+function parseCurrencyField(text, labelPattern) {
+  // Currency codes and symbols
+  const CUR = '(?:CHF|EUR|USD|GBP|€|\\$|£)';
+  const NUM = '[\\d.,]+';
+  // After the label, scan up to 80 chars for a currency+number token (either order)
+  // Negative sign can appear before the currency symbol or before the number
+  const re = new RegExp(
+    labelPattern.source +
+    `[\\s\\S]{0,80}?(-?${CUR}\\s*-?${NUM}|-?${NUM}\\s*${CUR})`,
+    'i'
+  );
+  const m = text.match(re);
+  if (!m) return null;
+
+  const token = m[1]; // e.g. "-€9.55" or "690,25 CHF" or "CHF -12.34"
+
+  // Extract the currency symbol/code from the token
+  const curMatch = token.match(new RegExp(CUR, 'i'));
+  if (!curMatch) return null;
+  // Normalise symbols to codes for consistent downstream use
+  const currencyRaw = curMatch[0];
+  const currency = currencyRaw === '€' ? 'EUR'
+                 : currencyRaw === '$' ? 'USD'
+                 : currencyRaw === '£' ? 'GBP'
+                 : currencyRaw.toUpperCase();
+
+  // Extract the numeric part: remove currency symbol/code, keep minus + digits
+  const numStr = token.replace(new RegExp(CUR, 'gi'), '').trim();
+  const amount = parseLocalFloat(numStr);
+  if (isNaN(amount)) return null;
+
+  return { amount, currency, formatted: `${numStr} ${currency}` };
+}
+
 test('Trade US500CASH with PUT option', async ({ page }) => {
-  test.setTimeout(240000); // 4 minutes timeout to fail faster if stuck
+  test.setTimeout(600000); // 10 minutes — login + up to 30 drag iterations can take 6-8 min
 
   // Inject stealth scripts to hide automation before navigating
   await page.addInitScript(() => {
@@ -78,9 +144,12 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
   const targetStrike = parseFloat(process.env.TRADE_STRIKE);
   const expiryDays = process.env.TRADE_EXPIRY_DAYS;
   const expiryTime = process.env.TRADE_EXPIRY_TIME;
+  const expiryDate = process.env.TRADE_EXPIRY_DATE;
   const accountType = process.env.TRADE_ACCOUNT_TYPE;
   
   // Client level wallet limits (from pricing tiers)
+  // 'Demo' = no limit (demo accounts use virtual money)
+  // Real account tiers cap the effective balance used for contract calculation
   const levelWalletLimits = {
     'Level I': 2000,
     'Level II': 3500,
@@ -93,23 +162,41 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     'Level IX': 100000,
     'Level X': 160000,
     'Elite': 250000,
-    'Standard': Infinity
+    'Demo': Infinity
   };
   
-  const clientLevel = process.env.TRADE_CLIENT_LEVEL || 'Standard';
-  const maxWalletByLevel = levelWalletLimits[clientLevel] || Infinity;
+  const clientLevel = process.env.TRADE_CLIENT_LEVEL || 'Demo';
+  // Cap only applies to REAL accounts; DEMO always has unlimited effective balance
+  const maxWalletByLevel = (accountType === 'REAL') ? (levelWalletLimits[clientLevel] ?? Infinity) : Infinity;
   
   // Extract hour from time (e.g., "21:00:00" -> "21:00")
   const expiryHourMinute = expiryTime?.substring(0, 5) || '21:00'; // "21:00"
   
-  // Compose the expiry selector text: "21:00(26D)"
-  // Check if expiryDays already has "D" suffix to avoid double "D"
-  const daysValue = expiryDays?.endsWith('D') ? expiryDays : `${expiryDays}D`;
+  // Compose normalized expiry tokens used to find the correct row in the calendar/dropdown.
+  const expiryDaysNum = parseInt(String(expiryDays || '').replace(/[^\d]/g, ''), 10);
+  const daysValue = Number.isFinite(expiryDaysNum)
+    ? `${expiryDaysNum}D`
+    : (expiryDays?.endsWith('D') ? expiryDays : `${expiryDays}D`);
+  const dayTokens = [daysValue, String(expiryDaysNum)].filter(Boolean);
+  const dateTokens = [];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(expiryDate || ''))) {
+    const [y, m, d] = String(expiryDate).split('-').map(Number);
+    const dd = String(d).padStart(2, '0');
+    const mm = String(m).padStart(2, '0');
+    const monthShort = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'][m - 1];
+    dateTokens.push(`${dd}/${mm}`, `${dd}-${mm}`, `${dd}.${mm}`, `${d}/${m}`, `${d}-${m}`, `${d}.${m}`);
+    if (monthShort) {
+      dateTokens.push(`${d} ${monthShort}`, `${monthShort} ${d}`);
+    }
+  }
   const expirySelector = `${expiryHourMinute}(${daysValue})`;
   
   console.log('\n📊 Trade Parameters:');
   console.log(`   Target Strike: ${targetStrike}`);
   console.log(`   Expiry: ${expirySelector}`);
+  if (expiryDate) {
+    console.log(`   Expiry Date: ${expiryDate}`);
+  }
   console.log(`   Account Type: ${accountType || 'NOT SET - DEFAULTING TO DEMO'}`);
   console.log(`   Client Level: ${clientLevel}`);
   if (isFinite(maxWalletByLevel)) {
@@ -122,10 +209,24 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     console.warn(`⚠️  WARNING: Invalid or missing account type "${accountType}", defaulting to DEMO`);
   }
 
+  // 🛑 SAFETY BLOCK: Demo-tier clients cannot trade on REAL accounts
+  if (clientLevel === 'Demo' && accountType === 'REAL') {
+    console.log('');
+    console.log('╔════════════════════════════════════════════════════════╗');
+    console.log('║           🚫 ACCESSO NEGATO - LIVELLO DEMO 🚫          ║');
+    console.log('╠════════════════════════════════════════════════════════╣');
+    console.log('║  Il tuo livello cliente è "Demo".                     ║');
+    console.log('║  Non è consentito operare su account REALE.           ║');
+    console.log('║  Contatta il supporto per aggiornare il tuo livello.  ║');
+    console.log('╚════════════════════════════════════════════════════════╝');
+    console.log('');
+    throw new Error('🛑 TRADE ABORTED: Livello cliente "Demo" non autorizzato su account REAL.');
+  }
+
   try {
     // Login with robust handling (from working version)
     console.log('🔐 Logging in...');
-    await page.goto('https://avaoptions.avatrade.com/it/login', { waitUntil: 'domcontentloaded' });
+    await page.goto('https://avaoptions.avatrade.com/en/login', { waitUntil: 'domcontentloaded' });
     console.log('✓ Page loaded, waiting for Cloudflare...');
     
     // Smart CF wait: each iteration polls title AND tries to click the Turnstile checkbox
@@ -165,6 +266,33 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       } catch (e) { /* page in transition */ }
     }
     console.log(cfPassed ? '✓ Cloudflare wait complete' : '⚠️  CF still active after 90s, proceeding...');
+
+    // Handle cookie consent PAGE (appears as a redirect before login, not just a banner)
+    try {
+      const consentSelectors = [
+        'button:has-text("Accept all")',
+        'button:has-text("Accetta tutti")',
+        'button:has-text("Accept All")',
+        'button:has-text("Accept")',
+        'button:has-text("Accetta")',
+        '#onetrust-accept-btn-handler',
+        'button[id*="accept"]',
+        'button[class*="accept"]',
+        '.cookie-accept',
+        '[aria-label*="Accept"]',
+      ];
+      for (const sel of consentSelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 3000 })) {
+            await btn.click();
+            console.log(`✓ Cookie consent accepted (selector: ${sel})`);
+            await page.waitForTimeout(2000);
+            break;
+          }
+        } catch {}
+      }
+    } catch {}
 
     // Wait for actual login form elements - confirms we are past Cloudflare
     console.log('⏳ Waiting for login form to appear...');
@@ -212,77 +340,81 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     // Take screenshot to debug what we see
     await page.screenshot({ path: getScreenshotPath('debug-before-login.png'), fullPage: true });
     
-    // Fill credentials - skip hidden inputs (e.g., Cloudflare Turnstile)
+    // Fill credentials
     console.log('Filling username...');
-    
-    // Try multiple strategies to find and fill username
     let usernameFilled = false;
-    const usernameSelectors = [
-      'input[type="text"]:visible',
-      'input[type="email"]:visible',
-      'input:not([type="password"]):not([type="hidden"]):visible',
-      'input:visible'
+    // Strategy: find the first non-password visible input
+    // getByLabel works regardless of language (label for the field)
+    const usernameStrategies = [
+      () => page.getByLabel(/email|username|user|utente|login|e-mail/i).first(),
+      () => page.getByPlaceholder(/email|username|user|utente|login/i).first(),
+      () => page.locator('input[type="email"]').first(),
+      () => page.locator('input[type="text"]:visible').first(),
+      () => page.locator('input:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="submit"]):visible').first(),
     ];
-    
-    for (const selector of usernameSelectors) {
+    for (const strategy of usernameStrategies) {
       try {
-        const usernameInput = page.locator(selector).first();
-        await usernameInput.waitFor({ state: 'visible', timeout: 5000 });
-        await usernameInput.click({ timeout: 3000 });
-        await usernameInput.fill(USER);
-        console.log(`✓ Username filled with selector: ${selector}`);
+        const el = strategy();
+        await el.fill(USER, { timeout: 3000 });
+        console.log('✓ Username filled');
         usernameFilled = true;
         break;
-      } catch (e) {
-        console.log(`Username selector ${selector} failed: ${e.message}`);
-      }
+      } catch {}
     }
-    
     if (!usernameFilled) {
       await page.screenshot({ path: getScreenshotPath('error-no-username.png'), fullPage: true });
       throw new Error('Could not find username input field');
     }
     
     console.log('Filling password...');
-    const passwordInput = page.locator('input[type="password"]:visible').first();
-    await passwordInput.waitFor({ state: 'visible', timeout: 5000 });
-    await passwordInput.click();
-    await passwordInput.fill(PASS);
-    
-    await page.waitForTimeout(1000);
+    let passwordInput;
+    try {
+      passwordInput = page.locator('input[type="password"]').first();
+      await passwordInput.fill(PASS, { timeout: 5000 });
+    } catch {
+      passwordInput = page.getByLabel(/password/i).first();
+      await passwordInput.fill(PASS, { timeout: 5000 });
+    }
+    console.log('✓ Password filled');
     
     console.log('Clicking login button...');
-    // Try multiple button selectors
-    const buttonSelectors = [
-      'button[type="submit"]',
-      'input[type="submit"]', 
-      'button:has-text("Login")',
-      'button:has-text("Accedi")',
-      'button:has-text("Sign in")',
-      'button:has-text("Log in")',
-      '[value="Login"]',
-      '[value="Accedi"]'
-    ];
-    
-    let buttonClicked = false;
-    for (const selector of buttonSelectors) {
-      try {
-        const button = page.locator(selector).first();
-        if (await button.count() > 0) {
-          await button.click();
+    let loginSubmitted = false;
+
+    // PRIMARY: press Enter on the password field — works on any login form
+    try {
+      await passwordInput.press('Enter');
+      console.log('✓ Login submitted via Enter');
+      loginSubmitted = true;
+    } catch {}
+
+    // FALLBACK: try button selectors if Enter didn't work
+    if (!loginSubmitted) {
+      const buttonSelectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Login")',
+        'button:has-text("Log in")',
+        'button:has-text("Log In")',
+        'button:has-text("LOG IN")',
+        'button:has-text("Accedi")',
+        'button:has-text("Sign in")',
+        'button:has-text("Sign In")',
+        '[value="Login"]',
+        '[value="Log in"]',
+        '[value="Accedi"]',
+      ];
+      for (const selector of buttonSelectors) {
+        try {
+          await page.locator(selector).first().click({ timeout: 3000 });
           console.log(`✓ Login button clicked with selector: ${selector}`);
-          buttonClicked = true;
+          loginSubmitted = true;
           break;
-        }
-      } catch (e) {
-        console.log(`Button selector ${selector} failed: ${e.message}`);
+        } catch {}
       }
     }
-    
-    if (!buttonClicked) {
-      console.log('Trying fallback button click...');
-      await page.locator('button').first().click();
-      console.log('✓ Fallback button clicked');
+
+    if (!loginSubmitted) {
+      console.log('⚠️  Login submit uncertain — proceeding anyway...');
     }
 
     console.log('Waiting after login...');
@@ -411,51 +543,45 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
 
     // Fallback: scan full body text if banner locator didn't work
     const textToSearch = unrealizedRawText || allText;
-    const unrealizedValueMatch = textToSearch.match(/(?:P\/L\s+Non\s+Realizzato|Unrealized\s+Profit)[\s\S]{0,80}?(-?[\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
-    const unrealizedMatch = textToSearch.match(/P\/L\s+Non\s+Realizzato|Unrealized\s+Profit/i);
 
-    // ── SECONDARY CHECK: Margine Richiesto (IT) / Margin Required (EN) ──
-    const marginRequiredMatch = allText.match(/(?:Margine\s+Richiesto|Margin\s+Required)[\s\S]{0,50}?([\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
+    // parseCurrencyField handles both EN ("CHF -12.34") and IT ("-12,34 CHF") formats
+    const unrealizedParsed = parseCurrencyField(textToSearch, /(?:P\/L\s+Non\s+Realizzato|Unrealized\s+Profit)/);
+    const unrealizedLabelFound = /P\/L\s+Non\s+Realizzato|Unrealized\s+Profit/i.test(textToSearch);
+
+    // ── SECONDARY CHECK: Margine Richiesto (IT) / Required Margin / Margin Required (EN) ──
+    const marginParsed = parseCurrencyField(allText, /(?:Margine\s+Richiesto|Required\s+Margin|Margin\s+Required)/);
 
     let tradeAlreadyOpen = false;
     let detectionReason = '';
 
-    // Check P/L Non Realizzato first (most reliable)
-    if (unrealizedValueMatch) {
-      const rawValue = unrealizedValueMatch[1].replace(/\./g, '').replace(',', '.');
-      const unrealizedAmount = parseFloat(rawValue);
-      const currency = unrealizedValueMatch[2];
-      const formatted = `${unrealizedValueMatch[1]} ${currency}`;
-      console.log(`📊 P/L Non Realizzato: ${formatted}`);
-      if (unrealizedAmount !== 0) {
+    // Check P/L Non Realizzato / Unrealized Profit first (most reliable)
+    if (unrealizedParsed) {
+      console.log(`📊 P/L Non Realizzato / Unrealized Profit: ${unrealizedParsed.formatted}`);
+      if (unrealizedParsed.amount !== 0) {
         tradeAlreadyOpen = true;
-        detectionReason = `P/L Non Realizzato = ${formatted}`;
+        detectionReason = `P/L Non Realizzato = ${unrealizedParsed.formatted}`;
       } else {
         console.log('✅ P/L Non Realizzato = 0 - nessun trade aperto');
       }
-    } else if (unrealizedMatch) {
+    } else if (unrealizedLabelFound) {
       // Field found but value not parsed - treat as unknown, fall through to secondary check
       console.log('⚠️  P/L Non Realizzato trovato ma valore non leggibile');
     } else {
-      console.log('⚠️  "P/L Non Realizzato" non trovato - verifico Margine Richiesto...');
+      console.log('⚠️  "P/L Non Realizzato" / "Unrealized Profit" non trovato - verifico margine...');
     }
 
-    // Secondary check: Margine Richiesto (used if primary check inconclusive)
-    if (!tradeAlreadyOpen && !unrealizedValueMatch && marginRequiredMatch) {
-      const marginValue = marginRequiredMatch[1].replace(/\./g, '').replace(',', '.');
-      const marginAmount = parseFloat(marginValue);
-      const marginCurrency = marginRequiredMatch[2];
-      const marginFormatted = `${marginRequiredMatch[1]} ${marginCurrency}`;
-      console.log(`📊 Margine Richiesto: ${marginFormatted}`);
-      if (marginAmount > 0) {
+    // Secondary check: Margine Richiesto / Required Margin (used if primary check inconclusive)
+    if (!tradeAlreadyOpen && !unrealizedParsed && marginParsed) {
+      console.log(`📊 Margine Richiesto / Required Margin: ${marginParsed.formatted}`);
+      if (marginParsed.amount > 0) {
         tradeAlreadyOpen = true;
-        detectionReason = `Margine Richiesto = ${marginFormatted}`;
+        detectionReason = `Margine Richiesto = ${marginParsed.formatted}`;
       } else {
-        console.log('✅ Margine Richiesto = 0 - nessun trade aperto');
+        console.log('✅ Margine Richiesto / Required Margin = 0 - nessun trade aperto');
       }
     }
 
-    if (!unrealizedValueMatch && !marginRequiredMatch) {
+    if (!unrealizedParsed && !marginParsed) {
       console.log('⚠️  Nessun indicatore trovato - assumendo nessun trade aperto');
     }
 
@@ -485,8 +611,14 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       // Take screenshot to see what we're working with
       await page.screenshot({ path: getScreenshotPath('debug-balance-reading.png'), fullPage: true });
       
-      // Now read cash balance
-      const balanceMatch = allText.match(/(?:Saldo|Balance|Cash)[\s\S]{0,100}([\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
+      // Now read cash balance — also do a fresh body text read here since more time
+      // has passed since allText was captured (balance widget may have rendered)
+      let freshBodyText = allText;
+      try { freshBodyText = await page.locator('body').textContent(); } catch {}
+
+      // Check both 3-letter code format (10,420.95 EUR) and symbol format (€10,420.95)
+      const balanceMatch = freshBodyText.match(/(?:Saldo|Balance|Cash)[\s\S]{0,100}([\d.,]+)\s*(CHF|EUR|USD|GBP)/i)
+                        || freshBodyText.match(/(?:Saldo|Balance|Cash)[\s\S]{0,100}([€$£¥])\s*([\d.,]{4,})/i);
       if (balanceMatch) {
         console.log(`  Found potential balance text: "${balanceMatch[0]}"`);
       } else {
@@ -495,6 +627,8 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       
       // Try multiple strategies to find and read the cash balance
       const balanceSelectors = [
+        'text="Cash Balance"',         // exact label as shown in AvaTrade header
+        'text="Saldo Contante"',        // Italian equivalent
         'text=/Saldo.*cash/i',
         'text=/Cash.*balance/i',
         'text=/Saldo/i',
@@ -512,16 +646,30 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
             balanceText = await element.textContent();
             console.log(`   Found with selector "${selector}": "${balanceText}"`);
             
-            // If text is too short, try getting parent or nearby elements
+            // If text is too short, try next sibling and parent for the associated value
             if (balanceText && balanceText.length < 15) {
+              // Try next sibling first (AvaTrade: label div followed by value div)
               try {
-                const parent = element.locator('..');
-                const parentText = await parent.textContent();
-                if (parentText && parentText.length > balanceText.length) {
-                  console.log(`   Using parent text: "${parentText}"`);
-                  balanceText = parentText;
+                const nextSib = element.locator('+ *');
+                if (await nextSib.count() > 0) {
+                  const sibText = await nextSib.textContent();
+                  if (sibText && /[€$£\d]/.test(sibText) && sibText.length < 40) {
+                    console.log(`   Using next sibling text: "${sibText}"`);
+                    balanceText = sibText;
+                  }
                 }
               } catch {}
+              // Then try parent (contains both label and value)
+              if (!balanceText || balanceText.length < 5) {
+                try {
+                  const parent = element.locator('..');
+                  const parentText = await parent.textContent();
+                  if (parentText && parentText.length > balanceText.length) {
+                    console.log(`   Using parent text: "${parentText}"`);
+                    balanceText = parentText;
+                  }
+                } catch {}
+              }
             }
             break;
           }
@@ -531,26 +679,37 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       if (balanceText) {
         // Try to extract numeric value and currency from various formats
         const patterns = [
-          /(\d+(?:[.,]\d{3})*[.,]\d{2})\s*([A-Z]{3})/i,  // European or US format with currency
-          /([A-Z]{3})\s*(\d+(?:[.,]\d{3})*[.,]\d{2})/i   // Currency first
+          /(\d+(?:[.,]\d{3})*[.,]\d{2})\s*([A-Z]{3})/i,       // number then currency code: 10,898.18 EUR
+          /([A-Z]{3})\s*(\d+(?:[.,]\d{3})*[.,]\d{2})/i,        // currency code then number: EUR 10,898.18
+          /([€$£¥])\s*(\d+(?:[.,]\d{3})*[.,]\d{2})/,           // symbol then number: €10,898.18
+          /(\d+(?:[.,]\d{3})*[.,]\d{2})\s*([€$£¥])/,           // number then symbol: 10,898.18€
         ];
+        
+        const symbolToCurrency = { '€': 'EUR', '$': 'USD', '£': 'GBP', '¥': 'JPY' };
         
         for (const pattern of patterns) {
           const match = balanceText.match(pattern);
           if (match) {
             let amount, currency;
-            if (match[2].length === 3 && /[A-Z]{3}/.test(match[2])) {
-              amount = match[1];
-              currency = match[2];
+            // match[1] could be number or currency/symbol, match[2] the other
+            const g1 = match[1], g2 = match[2];
+            if (/^\d/.test(g1)) {
+              // g1 is the number
+              amount = g1;
+              currency = symbolToCurrency[g2] || g2.toUpperCase();
             } else {
-              currency = match[1];
-              amount = match[2];
+              // g1 is the currency/symbol
+              currency = symbolToCurrency[g1] || g1.toUpperCase();
+              amount = g2;
             }
             
             // Convert to number (handle both European and US formats)
             let numericAmount;
             if (amount.includes(',') && amount.includes('.')) {
-              numericAmount = parseFloat(amount.replace(/\./g, '').replace(',', '.'));
+              // Whichever separator comes last is the decimal separator
+              numericAmount = amount.lastIndexOf('.') > amount.lastIndexOf(',')
+                ? parseFloat(amount.replace(/,/g, ''))                        // EN: 8,025.46
+                : parseFloat(amount.replace(/\./g, '').replace(',', '.'));    // EU: 8.025,46
             } else if (amount.includes(',')) {
               const parts = amount.split(',');
               if (parts[parts.length - 1].length === 2) {
@@ -576,7 +735,92 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       }
       
       if (!cashBalance) {
-        console.log('⚠️  Could not find or parse cash balance - this is expected if balance is not yet visible');
+        console.log('⚠️  Could not find or parse cash balance - trying DOM evaluation fallback...');
+
+        // --- Fallback: page.evaluate() DOM scan ---
+        // Runs inside the browser context — not subject to Playwright selector timing issues.
+        // Looks for the value element adjacent to the "Cash Balance" label in the AvaTrade header.
+        try {
+          const domBalanceText = await page.evaluate(() => {
+            // Strategy 1: find a leaf text node containing "Cash Balance", then check next sibling / parent
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+            let node;
+            while ((node = walker.nextNode())) {
+              if (/^cash\s*balance$|^saldo\s*contante$|^saldo\s*cash$/i.test((node.textContent || '').trim())) {
+                const labelEl = node.parentElement;
+                if (!labelEl) continue;
+                // Value is often the next sibling element
+                const nextSib = labelEl.nextElementSibling;
+                if (nextSib) {
+                  const t = (nextSib.textContent || '').trim();
+                  if (/[€$£]/.test(t) || /\d{3,}[.,]\d{2}/.test(t)) return t;
+                }
+                // Or the parent container has both label and value concatenated
+                const parent = labelEl.parentElement;
+                if (parent) {
+                  const t = (parent.textContent || '').trim();
+                  if (t.length < 60 && (/[€$£]/.test(t) || /\d{4,}[.,]\d{2}/.test(t))) return t;
+                }
+              }
+            }
+            // Strategy 2: find any leaf element whose text is purely a currency amount,
+            // inside a container that also contains the "Cash Balance" label
+            const leaves = document.querySelectorAll('span, div, p, td, label');
+            const amountRe = /^[€$£]\s*\d{1,3}(?:[.,]\d{3})*[.,]\d{2}$|^\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\s*[€$£EUR]$/;
+            for (const el of leaves) {
+              if (el.children.length === 0 && amountRe.test((el.textContent || '').trim())) {
+                const container = el.closest('div, section, header, nav, [class*="header"], [class*="toolbar"]');
+                if (container && /cash\s*balance|saldo/i.test(container.textContent || '')) {
+                  return (el.textContent || '').trim();
+                }
+              }
+            }
+            return null;
+          });
+
+          if (domBalanceText) {
+            console.log(`   DOM fallback found: "${domBalanceText}"`);
+            const fbPatterns = [
+              /([€$£¥])\s*(\d+(?:[.,]\d{3})*[.,]\d{2})/,
+              /(\d+(?:[.,]\d{3})*[.,]\d{2})\s*([€$£¥])/,
+              /([A-Z]{3})\s*(\d+(?:[.,]\d{3})*[.,]\d{2})/i,
+              /(\d+(?:[.,]\d{3})*[.,]\d{2})\s*([A-Z]{3})/i,
+            ];
+            const symMap = { '€': 'EUR', '$': 'USD', '£': 'GBP', '¥': 'JPY' };
+            for (const pat of fbPatterns) {
+              const m = domBalanceText.match(pat);
+              if (m) {
+                const g1 = m[1], g2 = m[2];
+                const isNumFirst = /^\d/.test(g1);
+                const amount   = isNumFirst ? g1 : g2;
+                const currency = isNumFirst ? (symMap[g2] || g2.toUpperCase()) : (symMap[g1] || g1.toUpperCase());
+                let numericAmount;
+                if (amount.includes(',') && amount.includes('.')) {
+                  numericAmount = amount.lastIndexOf('.') > amount.lastIndexOf(',')
+                    ? parseFloat(amount.replace(/,/g, ''))
+                    : parseFloat(amount.replace(/\./g, '').replace(',', '.'));
+                } else if (amount.includes(',')) {
+                  numericAmount = amount.split(',').pop().length === 2
+                    ? parseFloat(amount.replace(/\./g, '').replace(',', '.'))
+                    : parseFloat(amount.replace(/,/g, ''));
+                } else {
+                  numericAmount = parseFloat(amount);
+                }
+                if (!isNaN(numericAmount) && numericAmount > 0) {
+                  cashBalance = { amount: numericAmount, currency, formatted: `${amount} ${currency}` };
+                  console.log(`✅ Cash Balance (DOM fallback): ${cashBalance.formatted}`);
+                  break;
+                }
+              }
+            }
+          }
+        } catch (domErr) {
+          console.log(`   DOM fallback error: ${domErr.message}`);
+        }
+
+        if (!cashBalance) {
+          console.log('⚠️  Could not find or parse cash balance - this is expected if balance is not yet visible');
+        }
       }
     } catch (e) {
       console.log('⚠️  Error reading cash balance:', e.message);
@@ -601,7 +845,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         marginPerContract = parseFloat(tradeMargin);
         if (!isNaN(marginPerContract) && marginPerContract > 0) {
           marginSource = 'signal';
-          console.log(`   ✅ Margin from signal: ${marginPerContract} ${cashBalance?.currency || 'CHF'}`);
+          console.log(`   ✅ Margin from signal: ${marginPerContract} ${cashBalance?.currency || 'account currency'}`);
         } else {
           console.log(`   ⚠️  Invalid margin value in signal: "${tradeMargin}"`);
           marginPerContract = null;
@@ -614,7 +858,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       if (!marginPerContract) {
         marginPerContract = DEFAULT_MARGIN_PER_CONTRACT;
         marginSource = 'fallback';
-        console.log(`   ℹ️  Using fallback margin: ${marginPerContract} CHF`);
+        console.log(`   ℹ️  Using fallback margin: ${marginPerContract} ${cashBalance?.currency || 'account currency'}`);
       }
       
       // Calculate contracts if we have balance
@@ -628,8 +872,15 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
           console.log(`   ⚠️  Invalid input values (balance: ${balanceAmount}, margin: ${marginAmount})`);
           console.log(`   Using fallback: ${numberOfContracts}`);
         } else {
-          // Calculate: contracts = floor((0.5 * balance) / margin)
-          calculatedContracts = Math.floor((0.5 * balanceAmount) / marginAmount);
+          // Apply client level wallet cap: only for REAL accounts when balance exceeds tier max
+          let effectiveBalance = balanceAmount;
+          if (accountType === 'REAL' && isFinite(maxWalletByLevel) && balanceAmount > maxWalletByLevel) {
+            effectiveBalance = maxWalletByLevel;
+            console.log(`   ⚠️  Client Level "${clientLevel}" caps wallet: ${balanceAmount}€ → ${maxWalletByLevel}€`);
+          }
+
+          // Calculate: contracts = floor((0.5 * effectiveBalance) / margin)
+          calculatedContracts = Math.floor((0.5 * effectiveBalance) / marginAmount);
           
           // Validate calculation result
           if (isNaN(calculatedContracts) || !isFinite(calculatedContracts) || calculatedContracts < 0) {
@@ -637,26 +888,19 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
             calculatedContracts = numberOfContracts;
           }
           
-          // Apply client level wallet limit
-          let maxContractsByLevel = Number.POSITIVE_INFINITY;
-          if (isFinite(maxWalletByLevel)) {
-            maxContractsByLevel = Math.floor(maxWalletByLevel / marginAmount);
-            if (calculatedContracts > maxContractsByLevel) {
-              console.log(`   ⚠️  Client Level "${clientLevel}" limits wallet to ${maxWalletByLevel}€`);
-              console.log(`   ⚠️  This allows max ${maxContractsByLevel} contracts @ ${marginPerContract}€ each`);
-            }
-          }
-          
-          // Use the calculated value, respecting both account balance and client level limits
-          numberOfContracts = Math.min(calculatedContracts, maxContractsByLevel);
+          numberOfContracts = calculatedContracts;
         }
         
         console.log(`   📊 Account balance: ${cashBalance.amount} ${cashBalance.currency}`);
-        console.log(`   💰 Margin per contract: ${marginPerContract} ${cashBalance.currency} (${marginSource})`);
-        console.log(`   🧮 Calculation: floor((0.5 × ${cashBalance.amount}) / ${marginPerContract}) = ${calculatedContracts}`);
-        if (isFinite(maxWalletByLevel)) {
-          console.log(`   📋 Client Level: ${clientLevel} (max wallet: ${maxWalletByLevel}€)`);
+        if (accountType === 'REAL' && isFinite(maxWalletByLevel)) {
+          const effectiveDisplay = Math.min(parseFloat(cashBalance.amount), maxWalletByLevel);
+          console.log(`   📋 Client Level: ${clientLevel} (max wallet: ${maxWalletByLevel}€, effective: ${effectiveDisplay}€)`);
+          console.log(`   🧮 Calculation: floor((0.5 × ${effectiveDisplay}) / ${marginPerContract}) = ${calculatedContracts}`);
+        } else {
+          console.log(`   📋 Account type: ${accountType || 'DEMO'} (no wallet cap)`);
+          console.log(`   🧮 Calculation: floor((0.5 × ${cashBalance.amount}) / ${marginPerContract}) = ${calculatedContracts}`);
         }
+        console.log(`   💰 Margin per contract: ${marginPerContract} ${cashBalance.currency} (${marginSource})`);
         console.log(`   ✅ Final contracts: ${numberOfContracts}`);
         console.log('\n');
         console.log('╔════════════════════════════════════════════════════════╗');
@@ -729,11 +973,23 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       '[class*="instrument"]:has-text("US500")',
       '[class*="selected"]:has-text("US500")'
     ];
-    
+
+    // Only consider US500CASH "already selected" if it appears in the active header/title area
+    // Using a strict set of selectors that target the currently active instrument display
+    const us500ActiveSelectors = [
+      '[class*="instrumentName"]:has-text("US500")',
+      '[class*="instrument__name"]:has-text("US500")',
+      '[class*="header"]:has-text("US500CASH")',
+      '[class*="title"]:has-text("US500CASH")',
+      '[class*="activeInstrument"]:has-text("US500")',
+      '[class*="currentInstrument"]:has-text("US500")',
+    ];
+
     let alreadySelected = false;
-    for (const selector of us500Selectors) {
+    for (const selector of us500ActiveSelectors) {
       try {
-        if (await page.locator(selector).count() > 0) {
+        const count = await page.locator(selector).count();
+        if (count > 0) {
           alreadySelected = true;
           console.log(`✓ US500CASH already selected (found with: ${selector})`);
           break;
@@ -951,12 +1207,12 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     
     // Click the Sell/Vendi RCV button
     try {
-      await page.getByRole('button', { name: /Vendi RCV|Sell RCV|Vendi/i }).first().click({ timeout: 5000 });
+      await page.getByRole('button', { name: /Sell RCV|Vendi RCV/i }).first().click({ timeout: 5000 });
       console.log('✓ Clicked Vendi RCV button');
     } catch (e) {
       console.log('⚠️  Could not click Vendi RCV button:', e.message);
       // Try alternative selectors
-      await page.locator('button:has-text("Vendi")').first().click({ timeout: 5000 });
+      await page.locator('button:has-text("Sell RCV"), button:has-text("Vendi RCV")').first().click({ timeout: 5000 });
       console.log('✓ Clicked Vendi button (fallback)');
     }
     
@@ -967,20 +1223,59 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     
     // Try multiple strategies to click the expiry
     let expiryClicked = false;
+
+    // Strategy 0: Simple getByText WITHOUT exact (most reliable for format HH:MM(GGD))
+    if (!expiryClicked) {
+      try {
+        await page.getByText(expirySelector).click({ timeout: 5000, force: true });
+        console.log(`✓ Expiry clicked (simple text match: ${expirySelector})`);
+        expiryClicked = true;
+      } catch (e) {
+        console.log(`  ⚠️  Simple text match failed: ${e.message}`);
+      }
+    }
     
-    // Strategy 1: Exact text match with force
-    try {
-      await page.getByText(expirySelector, { exact: true }).click({ timeout: 5000, force: true });
-      console.log('✓ Expiry clicked (exact match)');
-      expiryClicked = true;
-    } catch (e) {
-      console.log(`  ⚠️  Exact match failed: ${e.message}`);
+    // Strategy 1: Exact text match with force (stricter)
+    if (!expiryClicked) {
+      try {
+        await page.getByText(expirySelector, { exact: true }).click({ timeout: 5000, force: true });
+        console.log('✓ Expiry clicked (exact match)');
+        expiryClicked = true;
+      } catch (e) {
+        console.log(`  ⚠️  Exact match failed: ${e.message}`);
+      }
+    }
+    
+    // Strategy 2: score visible options by time + day/date tokens and pick the best match
+    if (!expiryClicked) {
+      try {
+        const candidates = await page.locator('.expiration__itemValue').all();
+        let best = null;
+        for (const item of candidates) {
+          const raw = (await item.textContent()) || '';
+          const text = raw.replace(/\s+/g, ' ').trim().toLowerCase();
+          let score = 0;
+          if (text.includes(expiryHourMinute.toLowerCase())) score += 6;
+          if (dayTokens.some(t => text.includes(String(t).toLowerCase()))) score += 5;
+          if (dateTokens.some(t => text.includes(String(t).toLowerCase()))) score += 4;
+          if (!best || score > best.score) best = { item, text: raw.trim(), score };
+        }
+        if (best && best.score >= 9) {
+          await best.item.click({ timeout: 5000, force: true });
+          console.log(`✓ Expiry clicked (best-match score=${best.score}: ${best.text})`);
+          expiryClicked = true;
+        } else {
+          console.log('  ⚠️  Best-match strategy found no strong candidate');
+        }
+      } catch (e) {
+        console.log(`  ⚠️  Best-match strategy failed: ${e.message}`);
+      }
     }
     
     // Strategy 2: Click directly on the dropdown item with class
     if (!expiryClicked) {
       try {
-        await page.locator('.expiration__itemValue').filter({ hasText: expiryHourMinute }).filter({ hasText: expiryDays }).first().click({ timeout: 5000, force: true });
+        await page.locator('.expiration__itemValue').filter({ hasText: expiryHourMinute }).filter({ hasText: daysValue }).first().click({ timeout: 5000, force: true });
         console.log('✓ Expiry clicked (class selector)');
         expiryClicked = true;
       } catch (e) {
@@ -991,7 +1286,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     // Strategy 3: Partial text match with force
     if (!expiryClicked) {
       try {
-        await page.getByText(expiryHourMinute).filter({ hasText: expiryDays }).click({ timeout: 5000, force: true });
+        await page.getByText(expiryHourMinute).filter({ hasText: daysValue }).click({ timeout: 5000, force: true });
         console.log('✓ Expiry clicked (partial match)');
         expiryClicked = true;
       } catch (e) {
@@ -1002,7 +1297,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     // Strategy 4: Try regex pattern matching
     if (!expiryClicked) {
       try {
-        await page.locator(`text=/${expiryHourMinute}.*${expiryDays}/`).first().click({ timeout: 5000, force: true });
+        await page.locator(`text=/${expiryHourMinute}.*${daysValue}/`).first().click({ timeout: 5000, force: true });
         console.log(`✓ Expiry clicked (regex pattern)`);
         expiryClicked = true;
       } catch (e) {
@@ -1016,7 +1311,9 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         const expiryItems = await page.locator('.expiration__itemValue').all();
         for (const item of expiryItems) {
           const text = await item.textContent();
-          if (text && text.includes(expiryHourMinute) && text.includes(expiryDays)) {
+          if (text && text.includes(expiryHourMinute) && (
+            text.includes(daysValue) || dateTokens.some(t => text.toLowerCase().includes(String(t).toLowerCase()))
+          )) {
             await item.click({ force: true });
             console.log(`✓ Expiry clicked (found in items: ${text})`);
             expiryClicked = true;
@@ -1052,6 +1349,16 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         console.log(`✅ Expiry ${expirySelector} found in UI - assuming selected`);
         expiryVerified = true;
       }
+      if (!expiryVerified) {
+        const bodyText = ((await page.locator('body').textContent()) || '').toLowerCase();
+        const hasTime = bodyText.includes(expiryHourMinute.toLowerCase());
+        const hasDayOrDate = dayTokens.some(t => bodyText.includes(String(t).toLowerCase())) ||
+          dateTokens.some(t => bodyText.includes(String(t).toLowerCase()));
+        if (hasTime && hasDayOrDate) {
+          console.log('✅ Expiry verified via normalized time/day-date tokens');
+          expiryVerified = true;
+        }
+      }
     } catch (e) {
       console.log('⚠️  Could not verify expiry:', e.message);
     }
@@ -1063,7 +1370,65 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     }
     
     console.log('✅ Expiry verification passed');
-    
+
+    // ── Late balance recovery ──────────────────────────────────────────────────
+    // US500CASH selected + PUT/Sell/Expiry configured = 30-60s extra since login.
+    // The balance widget is almost certainly rendered now. If balance reading earlier
+    // failed, try once more with fresh body text and correct numberOfContracts.
+    if (!cashBalance) {
+      try {
+        console.log('💰 Late balance recovery (after trade config, fresh page scan)...');
+        const lateText = await page.locator('body').textContent();
+        const symMap = { '€': 'EUR', '$': 'USD', '£': 'GBP', '¥': 'JPY' };
+        // Look for Cash Balance keyword + amount within 100 chars
+        const kwMatch = lateText.match(/(?:Cash\s*Balance|Saldo\s+Contante|Saldo\s+Cash)([\s\S]{0,100})/i);
+        const scan = kwMatch ? kwMatch[1] : lateText;
+        const latePatterns = [
+          /([\u20ac$£¥])\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?!\d)/,
+          /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?!\d)\s*([\u20ac$£¥])/,
+          /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?!\d)\s*(EUR|USD|CHF|GBP)/i,
+          /(EUR|USD|CHF|GBP)\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?!\d)/i,
+        ];
+        for (const pat of latePatterns) {
+          const m = scan.match(pat);
+          if (!m) continue;
+          const isNumFirst = /^\d/.test(m[1]);
+          const rawAmt = isNumFirst ? m[1] : m[2];
+          const rawCur = isNumFirst ? m[2] : m[1];
+          const currency = symMap[rawCur] || (rawCur || 'EUR').toUpperCase();
+          let num;
+          if (rawAmt.includes(',') && rawAmt.includes('.')) {
+            num = rawAmt.lastIndexOf('.') > rawAmt.lastIndexOf(',')
+              ? parseFloat(rawAmt.replace(/,/g, ''))
+              : parseFloat(rawAmt.replace(/\./g, '').replace(',', '.'));
+          } else if (rawAmt.includes(',')) {
+            num = rawAmt.split(',').pop().length === 2
+              ? parseFloat(rawAmt.replace(/\./g, '').replace(',', '.'))
+              : parseFloat(rawAmt.replace(/,/g, ''));
+          } else {
+            num = parseFloat(rawAmt);
+          }
+          if (!isNaN(num) && num >= 100) {
+            cashBalance = { amount: num, currency, formatted: `${rawAmt} ${currency}` };
+            console.log(`✅ Cash Balance (late recovery): ${cashBalance.formatted}`);
+            // Recalculate contracts with real balance now that we have it
+            const tradeMarginLate = parseFloat(process.env.TRADE_MARGIN) || null;
+            if (tradeMarginLate && tradeMarginLate > 0) {
+              const recalc = Math.floor((0.5 * num) / tradeMarginLate);
+              const corrected = Math.max(1, Math.min(recalc, 10));
+              console.log(`   🔄 Recalculated contracts: ${corrected} (was: ${numberOfContracts})`);
+              numberOfContracts = corrected;
+            }
+            break;
+          }
+        }
+        if (!cashBalance) console.log('⚠️  Late recovery also failed - keeping fallback contracts');
+      } catch (lateErr) {
+        console.log(`   Late recovery error: ${lateErr.message}`);
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+
     // Set quantity with detailed logging
     console.log('\n📊 Setting up quantity...');
     
@@ -1429,16 +1794,16 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
 
     // Open trading window
     console.log('📊 Opening trading window to read strike price...');
-    await page.getByRole('button', { name: 'Vendi RCV' }).click();
-    console.log('✓ Clicked "Vendi RCV" button to open trading window');
+    await page.getByRole('button', { name: /Sell RCV|Vendi RCV/i }).first().click({ timeout: 8000 });
+    console.log('✓ Clicked “Vendi/Sell RCV” button to open trading window');
     await page.waitForTimeout(2000);
 
     // Get current strike price
     let currentStrike = null;
     try {
-      const sellBtn = page.locator('text=/sell \\d+[\\.,]\\d+ PUT/i').first();
-      const btnText = await sellBtn.textContent();
-      const match = btnText.match(/sell\s+([\d,\.]+)\s+PUT/i);
+      const sellBtn = page.locator('text=/(?:sell|vendi)\s+\d+[\.,]\d+\s+PUT/i').first();
+      const btnText = await sellBtn.textContent({ timeout: 3000 });
+      const match = btnText.match(/(?:sell|vendi)\s+([\d,\.]+)\s+PUT/i);
       if (match) {
         currentStrike = parseFloat(match[1].replace(',', '.'));
         console.log(`💰 Current strike: ${currentStrike}`);
@@ -1453,7 +1818,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       console.log('⚠️  Could not detect PUT handle on first try - handle may be above viewport, scrolling up...');
       
       // Scroll up by the same amount normally used to scroll down, to bring the handle into view
-      const _viewportSize = page.viewportSize();
+      const _viewportSize = page.viewportSize() || { width: 1920, height: 1080 };
       const _canvas = page.locator('canvas').first();
       const _canvasBox = await _canvas.boundingBox();
       const _scrollX = _canvasBox ? _canvasBox.x + _canvasBox.width / 2 : _viewportSize.width / 2;
@@ -1487,14 +1852,14 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       console.log(`   Reduction needed: ${reduction.toFixed(2)} points (${reductionPercent}%)`);
     }
 
-    // Close any overlays
-    await page.keyboard.press('Escape').catch(() => {});
-    await page.waitForTimeout(300);
+    // Do NOT press Escape here — the trading window is already open and we need it
+    // open for iteration 1's strike reading. The per-drag Escape closes it before each drag.
+    await page.waitForTimeout(500); // let the panel finish rendering
 
     // Iterative drag loop to reach target strike
     const maxIterations = 30; // Increased from 20 to allow more attempts for larger strike movements
     const dragDistance = 150; // pixels per drag
-    const strikeThreshold = 75; // acceptable difference from target (US500CASH moves in ~25-50pt increments; 75pt tolerance avoids abort on small overshoot)
+    const strikeThreshold = 25; // acceptable difference from target (US500CASH moves in 25pt increments; match within 1 step)
     const scrollThreshold = 200; // pixels from bottom to trigger scroll
     const scrollAmount = 300; // pixels to scroll down
     
@@ -1521,7 +1886,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       console.log(`✅ PUT handle at (${detection.x}, ${detection.y})`);
       
       // Check if handle is in lower half of viewport and scroll to keep it centered
-      const viewportSize = page.viewportSize();
+      const viewportSize = page.viewportSize() || { width: 1920, height: 1080 };
       const viewportMiddle = viewportSize.height / 2;
       const handlePositionPercent = ((detection.y / viewportSize.height) * 100).toFixed(0);
       
@@ -1634,32 +1999,44 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       // Read current strike with longer timeout for slow PCs
       let currentIterationStrike = null;
       try {
-        const sellBtn = page.locator('text=/sell \\d+[\\.,]\\d+ PUT/i').first();
-        // Wait for element to be visible with extended timeout
-        await sellBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-        const btnText = await sellBtn.textContent({ timeout: 3000 });
-        const match = btnText.match(/sell\s+([\d,\.]+)\s+PUT/i);
-        if (match) {
-          currentIterationStrike = parseFloat(match[1].replace(',', '.'));
-          console.log(`💰 Current strike: ${currentIterationStrike}`);
-        } else {
-          console.log(`⚠️  Could not parse strike from text: "${btnText}"`);
+        // On first iteration, dump all button/label texts to discover the strike element format
+        if (iteration === 1) {
+          const allBtns = await page.locator('button').allTextContents().catch(() => []);
+          const allLabels = await page.locator('[class*="strike"],[class*="price"],[class*="lvl"],[class*="level"]').allTextContents().catch(() => []);
+          console.log('🔍 DEBUG button texts:', JSON.stringify(allBtns.filter(t => t.trim())));
+          console.log('🔍 DEBUG price/strike labels:', JSON.stringify(allLabels.filter(t => t.trim())));
         }
-      } catch (e) {
-        console.log('⚠️  Could not read strike price:', e.message);
-        // Try waiting a bit more and retry once
-        await page.waitForTimeout(2000);
-        try {
-          const sellBtn = page.locator('text=/sell \\d+[\\.,]\\d+ PUT/i').first();
-          const btnText = await sellBtn.textContent({ timeout: 3000 });
-          const match = btnText.match(/sell\s+([\d,\.]+)\s+PUT/i);
-          if (match) {
-            currentIterationStrike = parseFloat(match[1].replace(',', '.'));
-            console.log(`💰 Current strike (retry): ${currentIterationStrike}`);
+        // Try multiple patterns: with decimal, without decimal, and broader number search
+        const strikePatterns = [
+          /(?:sell|vendi)\s+([\d][\d,.]*[\d])\s+PUT/i,   // Sell 6325 PUT / Sell 6,325.0 PUT
+          /PUT[\s\S]{0,10}?([5-9]\d{3}(?:[.,]\d+)?)/i,    // PUT ... 6325 (nearby)
+          /([5-9]\d{3}(?:[.,]\d+)?)\s+PUT/i,              // 6325 PUT
+        ];
+        const sellBtn = page.locator('button, [role="button"]').first();
+        // Search all buttons/elements for a strike-looking text
+        const allBtnTexts = await page.locator('button, [role="button"], [class*="rcv"], [class*="trade"]').allTextContents().catch(() => []);
+        for (const txt of allBtnTexts) {
+          for (const pat of strikePatterns) {
+            const m = txt.match(pat);
+            if (m) {
+              const raw = m[1].replace(/\s/g, '');
+              // last-separator-wins: same logic as balance parsing
+              currentIterationStrike = raw.lastIndexOf('.') > raw.lastIndexOf(',')
+                ? parseFloat(raw.replace(/,/g, ''))
+                : parseFloat(raw.replace(/\./g, '').replace(',', '.'));
+              if (currentIterationStrike > 1000) { // sanity: must be a real price
+                console.log(`💰 Current strike: ${currentIterationStrike} (from "${txt.trim()}")`);
+                break;
+              } else {
+                currentIterationStrike = null;
+              }
+            }
           }
-        } catch (e2) {
-          console.log('⚠️  Retry failed, continuing without strike price');
+          if (currentIterationStrike) break;
         }
+        if (!currentIterationStrike) console.log('⚠️  Could not read strike price from any element');
+      } catch (e) {
+        console.log('⚠️  Strike reading error:', e.message);
       }
       
       // Check if we've reached the target
@@ -1667,19 +2044,18 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         const diff = currentIterationStrike - targetStrike;
         console.log(`📏 Distance from target: ${diff.toFixed(2)} points`);
         
-        if (Math.abs(diff) <= strikeThreshold) {
-          console.log(`🎉 Target reached! Strike: ${currentIterationStrike} (target: ${targetStrike})`);
+        // Exit loop ONLY on exact match (US500CASH steps are 25pt, so < 1 = exact)
+        if (Math.abs(diff) < 1) {
+          console.log(`🎉 Target reached exactly! Strike: ${currentIterationStrike} (target: ${targetStrike})`);
           break;
         }
         
+        console.log(`   ↪️  Not at target yet (${diff > 0 ? '+' : ''}${diff.toFixed(0)}pt), continuing to adjust...`);
+        
         if (diff < 0) {
           console.log(`⚠️  Overshot target! Current: ${currentIterationStrike}, Target: ${targetStrike}`);
-          // Try to recover by dragging UP a small amount
+          // Always attempt recovery regardless of overshoot size
           const overshootAmt = Math.abs(diff);
-          if (overshootAmt <= strikeThreshold) {
-            console.log(`   ✅ Overshoot within threshold (${overshootAmt}pts ≤ ${strikeThreshold}pts), accepting`);
-            break;
-          }
           // Calculate how many px to drag up (use calibrated ratio or fallback)
           const recoverPts = overshootAmt;
           const recoverPx = pointsPerPixel ? Math.max(5, Math.round((recoverPts / pointsPerPixel) * 0.7)) : Math.max(5, Math.round(recoverPts / 2));
@@ -1705,7 +2081,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
             console.log(`   ✅ Recovery drag completed`);
             // Reopen trading window so next iteration can read the strike
             try {
-              await page.getByRole('button', { name: 'Vendi RCV' }).click({ timeout: 5000 });
+              await page.getByRole('button', { name: /Sell RCV|Vendi RCV/i }).first().click({ timeout: 5000 });
               await page.waitForTimeout(2000);
               console.log(`   📊 Trading window re-opened after recovery`);
             } catch {}
@@ -1823,7 +2199,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         // Try multiple times with longer timeout for slow PCs
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
-            await page.getByRole('button', { name: 'Vendi RCV' }).click({ timeout: 5000 });
+            await page.getByRole('button', { name: /Sell RCV|Vendi RCV/i }).first().click({ timeout: 5000 });
             console.log(`✓ Trading window opened (attempt ${attempt})`);
             windowOpened = true;
             break;
@@ -1849,16 +2225,23 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     console.log('\n📊 Final Result:');
     let finalStrike = null;
     try {
-      const finalSellBtn = page.locator('text=/sell \\d+[\\.,]\\d+ PUT/i').first();
-      const finalBtnText = await finalSellBtn.textContent();
-      const finalMatch = finalBtnText.match(/sell\s+([\d,\.]+)\s+PUT/i);
-      if (finalMatch) {
-        finalStrike = parseFloat(finalMatch[1].replace(',', '.'));
+      const allFinalTexts = await page.locator('button, [role="button"], [class*="rcv"], [class*="trade"]').allTextContents().catch(() => []);
+      for (const txt of allFinalTexts) {
+        const m = txt.match(/(?:sell|vendi)\s+([\d][\d,.]*[\d])\s+PUT/i) || txt.match(/([\d][\d,.]*[\d])\s+PUT/i);
+        if (m) {
+          const raw = m[1].replace(/\s/g, '');
+          const v = raw.lastIndexOf('.') > raw.lastIndexOf(',')
+            ? parseFloat(raw.replace(/,/g, ''))
+            : parseFloat(raw.replace(/\./g, '').replace(',', '.'));
+          if (v > 1000) { finalStrike = v; break; }
+        }
+      }
+      if (finalStrike) {
         console.log(`   Initial: ${currentStrike}`);
         console.log(`   Target:  ${targetStrike}`);
         console.log(`   Final:   ${finalStrike}`);
         console.log(`   Total iterations: ${iteration}`);
-        console.log(`   Total change: ${(currentStrike - finalStrike).toFixed(2)} points`);
+        if (currentStrike) console.log(`   Total change: ${(currentStrike - finalStrike).toFixed(2)} points`);
         
         if (targetStrike && Math.abs(finalStrike - targetStrike) <= strikeThreshold) {
           console.log('   ✅ Target strike reached!');
@@ -1877,7 +2260,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     
     let shouldExecute = true;
-    const maxAllowedDeviation = strikeThreshold; // Use same threshold from iterations
+    const maxAllowedDeviation = 0; // Exact match required — abort if strike is not exactly on target
     
     // Check 1: Strike price validation
     if (targetStrike && finalStrike) {
@@ -1888,13 +2271,13 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
       console.log(`   Target:    ${targetStrike}`);
       console.log(`   Final:     ${finalStrike}`);
       console.log(`   Deviation: ${deviation.toFixed(2)} points (${deviationPercent}%)`);
-      console.log(`   Threshold: ${maxAllowedDeviation} points`);
+      console.log(`   Required:  EXACT MATCH (0 points tolerance)`);
       
       if (deviation > maxAllowedDeviation) {
-        console.log(`   ❌ FAIL - Strike price too far from target!`);
+        console.log(`   ❌ FAIL - Strike is not exactly at target! Trade aborted.`);
         shouldExecute = false;
       } else {
-        console.log(`   ✅ PASS - Strike within acceptable range`);
+        console.log(`   ✅ PASS - Strike exactly at target`);
       }
     } else {
       console.log(`\n1️⃣  Strike Price Validation:`);
@@ -1983,115 +2366,143 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // ✅ MANDATORY POST-EXECUTION VERIFICATION (with retry/backoff)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // This is REQUIRED to confirm trade execution. Without this check,
-    // we cannot be sure the trade was actually opened on the broker side.
-    // The broker UI may take several seconds to update the margin field.
+    // Two indicators checked (IT/EN):
+    //   1. P/L Non Realizzato / Unrealized Profit – non-zero when trade is open
+    //      (starts negative due to bid/ask spread → most reliable signal)
+    //   2. Margine Richiesto / Required Margin / Margin Required – > 0 when open
+    // Trade is confirmed if EITHER indicator passes.
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    console.log('\n🔍 MANDATORY VERIFICATION: Reading Margine Richiesto (with retries)...');
-    console.log('   ℹ️  This check is REQUIRED to confirm trade execution');
-    console.log('   ℹ️  Will retry multiple times if margin is still 0 (UI may be slow)');
-    
+    console.log('\n🔍 MANDATORY VERIFICATION: P/L Non Realizzato + Margine Richiesto (IT/EN, with retries)...');
+    console.log('   ℹ️  Primary:  P/L Non Realizzato / Unrealized Profit ≠ 0');
+    console.log('   ℹ️  Fallback: Margine Richiesto / Required Margin > 0');
+    console.log('   ℹ️  Will retry multiple times if UI has not updated yet');
+
     const maxAttempts = 6; // total attempts
     const baseDelay = 3000; // initial delay in ms (3s, 6s, 9s, 12s, 15s, 18s)
     let postMarginAmount = null;
     let postMarginCurrency = null;
     let postMarginFormatted = null;
+    let postUnrealizedAmount = null;
+    let postUnrealizedFormatted = null;
+    let tradeConfirmedByPL = false;
+    let tradeConfirmedByMargin = false;
     let lastReadError = null;
-    
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const waitMs = baseDelay * attempt; // increasing backoff: 3s, 6s, 9s...
-      console.log(`   Attempt ${attempt}/${maxAttempts}: waiting ${waitMs}ms before reading margin`);
+      console.log(`   Attempt ${attempt}/${maxAttempts}: waiting ${waitMs}ms before reading indicators`);
       await page.waitForTimeout(waitMs);
       await page.screenshot({ path: getScreenshotPath(`debug-margin-post-exec-attempt-${attempt}.png`), fullPage: true });
-      
+
       try {
         const postExecText = await page.locator('body').textContent();
-        const postExecMarginMatch = postExecText.match(/Margine\s+Richiesto[\s\S]{0,50}?([\d.,]+)\s*(CHF|EUR|USD|GBP)/i);
-        
-        if (postExecMarginMatch) {
-          const postMarginValue = postExecMarginMatch[1].replace(/\./g, '').replace(',', '.');
-          postMarginAmount = parseFloat(postMarginValue);
-          postMarginCurrency = postExecMarginMatch[2];
-          postMarginFormatted = `${postExecMarginMatch[1]} ${postMarginCurrency}`;
-          
-          console.log(`   Read Margine Richiesto: ${postMarginFormatted}`);
-          
+
+        // ── Check 1: P/L Non Realizzato (IT) / Unrealized Profit (EN) ──
+        // When a trade is open this is always non-zero (negative due to spread).
+        // parseCurrencyField handles both EN "CHF -12.34" and IT "-12,34 CHF".
+        const postUnrealizedParsed = parseCurrencyField(postExecText, /(?:P\/L\s+Non\s+Realizzato|Unrealized\s+Profit)/);
+        if (postUnrealizedParsed) {
+          postUnrealizedAmount = postUnrealizedParsed.amount;
+          postUnrealizedFormatted = postUnrealizedParsed.formatted;
+          console.log(`   Read P/L Non Realizzato / Unrealized Profit: ${postUnrealizedFormatted}`);
+          if (postUnrealizedAmount !== 0) {
+            console.log('   ✅ P/L ≠ 0 → trade execution confirmed!');
+            tradeConfirmedByPL = true;
+            break;
+          } else {
+            console.log('   ⏳ P/L = 0, may not have updated yet, checking margin...');
+          }
+        }
+
+        // ── Check 2: Margine Richiesto (IT) / Required Margin / Margin Required (EN) ──
+        const postMarginParsed = parseCurrencyField(postExecText, /(?:Margine\s+Richiesto|Required\s+Margin|Margin\s+Required)/);
+        if (postMarginParsed) {
+          postMarginAmount = postMarginParsed.amount;
+          postMarginCurrency = postMarginParsed.currency;
+          postMarginFormatted = postMarginParsed.formatted;
+          console.log(`   Read Margine Richiesto / Required Margin: ${postMarginFormatted}`);
           if (postMarginAmount > 0) {
             console.log('   ✅ Margin > 0 → trade execution confirmed!');
+            tradeConfirmedByMargin = true;
             break;
           } else {
             console.log('   ⏳ Margin is still 0, UI may not have updated yet, will retry...');
           }
         } else {
-          console.log('   ⚠️  Could not find Margine Richiesto in page text, will retry...');
+          console.log('   ⚠️  Could not find Margine Richiesto/Required Margin in page text, will retry...');
         }
       } catch (readErr) {
         lastReadError = readErr;
         console.log(`   ⚠️  Error reading page text: ${readErr.message}, will retry...`);
       }
     }
-    
+
+    const tradeConfirmed = tradeConfirmedByPL || tradeConfirmedByMargin;
+
     // After all retries, check final result
-    if (postMarginAmount === null) {
-      console.error('❌ CRITICAL ERROR: Cannot read Margine Richiesto after execution (all retries failed)');
+    if (postMarginAmount === null && postUnrealizedAmount === null) {
+      console.error('❌ CRITICAL ERROR: Cannot read any verification indicator after execution (all retries failed)');
       console.error('   Unable to verify if trade was opened');
       if (lastReadError) console.error('   Last error:', lastReadError.message);
       await page.screenshot({ path: getScreenshotPath('margine-not-found.png'), fullPage: true });
-      throw new Error('❌ TRADE VERIFICATION FAILED: Cannot read Margine Richiesto field after retries');
+      throw new Error('❌ TRADE VERIFICATION FAILED: Cannot read P/L Non Realizzato or Margine Richiesto/Required Margin after retries');
     }
-    
-    console.log(`📊 Margine Richiesto post-esecuzione: ${postMarginFormatted}`);
+
+    const confirmedIndicatorStr = tradeConfirmedByPL
+      ? `P/L Non Realizzato = ${postUnrealizedFormatted}`
+      : (tradeConfirmedByMargin ? `Margine Richiesto = ${postMarginFormatted}` : '');
+    const summaryStr = `P/L=${postUnrealizedFormatted || 'n/a'}, Margine=${postMarginFormatted || 'n/a'}`;
+    console.log(`📊 Indicatori post-esecuzione: ${summaryStr}`);
     console.log('');
-    
-    if (postMarginAmount > 0) {
+
+    if (tradeConfirmed) {
       console.log('╔════════════════════════════════════════════════════════╗');
       console.log('║           ✅ TRADE EXECUTION CONFIRMED ✅             ║');
       console.log('╠════════════════════════════════════════════════════════╣');
-      console.log(`║  Margine Richiesto: ${postMarginFormatted.padEnd(30)} ║`);
+      console.log(`║  ${confirmedIndicatorStr.padEnd(52)} ║`);
       console.log('║  Il trade è stato aperto con successo!                ║');
       console.log('║  Il segnale verrà cancellato dal database             ║');
       console.log('╚════════════════════════════════════════════════════════╝');
       console.log('');
-      
-      // Read initial P&L (Profit/Loss) after trade execution
-      console.log('💰 Reading initial P&L...');
-      await page.waitForTimeout(2000); // Wait for P&L to update
-      
-      try {
-        const plText = await page.locator('body').textContent();
-        // Match P/L field with various formats: "P/L: -123.45 CHF" or "P/L -123.45" or "P/L: 123.45"
-        const plMatch = plText.match(/P[\/\s]*L[\s:]*(-?[\d.,]+)\s*(CHF|EUR|USD|GBP)?/i);
-        
-        if (plMatch) {
-          const plValue = plMatch[1].replace(/\./g, '').replace(',', '.');
-          const plAmount = parseFloat(plValue);
-          const plCurrency = plMatch[2] || postMarginCurrency;
-          const plFormatted = `${plMatch[1]} ${plCurrency}`;
-          
-          console.log(`📊 P/L iniziale: ${plFormatted}`);
-          console.log(`💰 PL_INFO: ${plAmount}`); // For monitor to capture
-        } else {
-          console.log('⚠️  P/L non trovato, verrà aggiornato successivamente');
-          console.log('💰 PL_INFO: 0'); // Default to 0
+
+      // If P/L was already read and non-zero, use it directly (no extra wait needed).
+      // Otherwise fall back to a separate page read.
+      if (postUnrealizedAmount !== null && postUnrealizedAmount !== 0) {
+        console.log(`📊 P/L iniziale: ${postUnrealizedFormatted}`);
+        console.log(`💰 PL_INFO: ${postUnrealizedAmount}`);
+      } else {
+        console.log('💰 Reading initial P&L...');
+        await page.waitForTimeout(2000);
+        try {
+          const plText = await page.locator('body').textContent();
+          const plParsed = parseCurrencyField(plText, /(?:P\/L\s+Non\s+Realizzato|Unrealized\s+Profit)/);
+          if (plParsed) {
+            console.log(`📊 P/L iniziale: ${plParsed.formatted}`);
+            console.log(`💰 PL_INFO: ${plParsed.amount}`);
+          } else {
+            console.log('⚠️  P/L non trovato, verrà aggiornato successivamente');
+            console.log('💰 PL_INFO: 0');
+          }
+        } catch (plError) {
+          console.log('⚠️  Errore lettura P/L:', plError.message);
+          console.log('💰 PL_INFO: 0');
         }
-      } catch (plError) {
-        console.log('⚠️  Errore lettura P/L:', plError.message);
-        console.log('💰 PL_INFO: 0');
       }
     } else {
       console.log('╔════════════════════════════════════════════════════════╗');
       console.log('║          ❌ TRADE EXECUTION FAILED ❌                 ║');
       console.log('╠════════════════════════════════════════════════════════╣');
-      console.log(`║  Margine Richiesto: ${postMarginFormatted.padEnd(30)} ║`);
+      console.log(`║  P/L Non Realizzato: ${(postUnrealizedFormatted || '0').padEnd(28)} ║`);
+      console.log(`║  Margine Richiesto:  ${(postMarginFormatted || '0').padEnd(28)} ║`);
       console.log('║  Il trade NON è stato aperto                          ║');
-      console.log('║  (Click su Esegui ma nessun margine assegnato)        ║');
+      console.log('║  (Click su Esegui ma nessun indicatore confermato)    ║');
       console.log('║                                                        ║');
       console.log('║  Il segnale NON verrà cancellato                      ║');
       console.log('║  Il monitor riproverà automaticamente                 ║');
       console.log('╚════════════════════════════════════════════════════════╝');
       console.log('');
       await page.screenshot({ path: getScreenshotPath('trade-not-executed.png'), fullPage: true });
-      throw new Error(`❌ TRADE EXECUTION FAILED: Margine Richiesto is still 0.0 after clicking Esegui. Trade was NOT opened on broker side.`);
+      throw new Error(`❌ TRADE EXECUTION FAILED: Neither P/L Non Realizzato nor Margine Richiesto/Required Margin confirmed trade after clicking Esegui. Trade was NOT opened on broker side.`);
     }
 
     console.log('\n✅ Test completed');
