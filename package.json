@@ -1,6 +1,6 @@
 {
   "name": "avaauto",
-  "version": "1.4.0",
+  "version": "1.5.63",
   "description": "Automated trading for AvaOptions with database monitoring and web interface - v1.1.8",
   "type": "module",
   "main": "src/main.js",

@@ -429,85 +429,77 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
     await page.screenshot({ path: getScreenshotPath('before-account-selection.png'), fullPage: true });
     
     try {
-      // Build account selectors based on the signal's account type
-      let accountSelectors = [];
-      
-      if (targetAccountType === 'DEMO') {
-        // Look for DEMO/Practice account selectors
-        accountSelectors = [
-          'text=DEMO',
-          'text=Demo',
-          'text=Practice',
-          'button:has-text("DEMO")',
-          'button:has-text("Demo")',
-          'button:has-text("Practice")',
-          '[class*="demo"]',
-          '[class*="practice"]'
-        ];
-      } else if (targetAccountType === 'REAL') {
-        // Look for REAL account selectors (from codegen)
-        accountSelectors = [
-          '.asideMenu_radio', // Radio button - .first() = REAL, .nth(1) = DEMO
-          'text=REAL', // Text with exact match
-          'text=Real',
-          'button:has-text("REAL")',
-          'button:has-text("Real")',
-          '[class*="real"]'
-        ];
-      }
-      
-      // Add common continue/select buttons as fallback
-      accountSelectors.push(
-        'button:has-text("Continue")',
-        'button:has-text("Continua")',
-        'button:has-text("Select")',
-        'button:has-text("Seleziona")'
-      );
-      
-      let accountSelected = false;
-      for (const selector of accountSelectors) {
-        try {
-          const element = page.locator(selector).first();
-          const count = await element.count();
-          console.log(`   Trying selector: ${selector} (found: ${count})`);
-          
-          if (count > 0) {
-            // Special handling for .asideMenu_radio with REAL: skip text check, it's a radio button
-            if (selector === '.asideMenu_radio' && targetAccountType === 'REAL') {
-              await element.click(); // .first() already applied = REAL
-              console.log(`✓ Clicked ${targetAccountType} account with selector: ${selector} (radio button - first = REAL)`);
-              accountSelected = true;
-              break;
+      const accountsTitle = page.getByText(/^ACCOUNTS$|^CONTI$/i).first();
+
+      const selectTargetAccount = async () => {
+        const accountSelectors = targetAccountType === 'DEMO'
+          ? [
+              page.getByText(/^DEMO$|^PRACTICE$/i).last(),
+              page.locator('.asideMenu_radio').nth(1), // Accounts modal: REAL first, DEMO second
+              page.locator('[class*="demo"]:visible, [class*="practice"]:visible').first()
+            ]
+          : [
+              page.getByText(/^REAL$/i).last(),
+              page.locator('.asideMenu_radio').first(),
+              page.locator('[class*="real"]:visible').first()
+            ];
+
+        for (const element of accountSelectors) {
+          try {
+            if (await element.isVisible({ timeout: 1000 })) {
+              await element.click({ timeout: 3000 });
+              console.log(`✓ Selected ${targetAccountType} account`);
+              return true;
             }
-            
-            // Additional check: if looking for specific account type, verify the element text
-            const elementText = await element.textContent().catch(() => '');
-            console.log(`   Element text: "${elementText}"`);
-            
-            if (targetAccountType === 'DEMO' && elementText.toUpperCase().includes('REAL') && !elementText.toUpperCase().includes('REALIZED')) {
-              console.log(`   Skipping element with text "${elementText}" (looking for DEMO)`);
-              continue;
-            }
-            if (targetAccountType === 'REAL' && elementText.toUpperCase().includes('DEMO')) {
-              console.log(`   Skipping element with text "${elementText}" (looking for REAL)`);
-              continue;
-            }
-            
-            await element.click();
-            console.log(`✓ Clicked ${targetAccountType} account with selector: ${selector}`);
-            accountSelected = true;
-            break;
+          } catch (e) {
+            // Some account badges have a decorative layer over them: click the same
+            // element forcibly rather than accidentally selecting another account.
+            try {
+              if (await element.isVisible({ timeout: 500 })) {
+                await element.click({ force: true, timeout: 2000 });
+                console.log(`✓ Selected ${targetAccountType} account (forced click)`);
+                return true;
+              }
+            } catch {}
           }
-        } catch (e) {
-          console.log(`Account selector ${selector} failed: ${e.message}`);
         }
+        return false;
+      };
+
+      // On some users the account modal is delayed. "Continue Registration" is
+      // not an account selector: it only enters the platform and causes ACCOUNTS
+      // to appear a few seconds later.
+      let accountSelected = false;
+      for (let attempt = 1; attempt <= 15 && !accountSelected; attempt++) {
+        if (await accountsTitle.isVisible({ timeout: 500 }).catch(() => false)) {
+          accountSelected = await selectTargetAccount();
+          if (accountSelected) break;
+        }
+
+        const continueRegistration = page.getByRole('button', { name: /continue\s+registration|continua\s+registrazione/i }).first();
+        if (await continueRegistration.isVisible({ timeout: 300 }).catch(() => false)) {
+          console.log('✓ Entering platform; waiting for account selector...');
+          await continueRegistration.click({ timeout: 3000 }).catch(() => continueRegistration.click({ force: true }));
+        }
+        await page.waitForTimeout(1000);
       }
-      
+
+      // The modal may finish animating only after the target was clicked.
+      if (accountSelected) {
+        await accountsTitle.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => {});
+      }
+
+      if (await accountsTitle.isVisible({ timeout: 500 }).catch(() => false)) {
+        await page.screenshot({ path: getScreenshotPath('error-account-selection-blocked.png'), fullPage: true });
+        throw new Error(`Account selector is still open: could not select ${targetAccountType}`);
+      }
+
       if (!accountSelected) {
-        console.log('No specific account selector found, checking if we are already in trading interface...');
+        console.log('No account modal appeared; assuming the requested account is already active.');
       }
     } catch (e) {
-      console.log('Account selection step skipped:', e.message);
+      console.log('Account selection failed:', e.message);
+      throw e;
     }
     
     await page.waitForTimeout(5000);
@@ -879,8 +871,8 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
             console.log(`   ⚠️  Client Level "${clientLevel}" caps wallet: ${balanceAmount}€ → ${maxWalletByLevel}€`);
           }
 
-          // Calculate: contracts = floor((0.5 * effectiveBalance) / margin)
-          calculatedContracts = Math.floor((0.5 * effectiveBalance) / marginAmount);
+          // Calculate: contracts = floor((0.45 * effectiveBalance) / margin)
+          calculatedContracts = Math.floor((0.45 * effectiveBalance) / marginAmount);
           
           // Validate calculation result
           if (isNaN(calculatedContracts) || !isFinite(calculatedContracts) || calculatedContracts < 0) {
@@ -895,10 +887,10 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         if (accountType === 'REAL' && isFinite(maxWalletByLevel)) {
           const effectiveDisplay = Math.min(parseFloat(cashBalance.amount), maxWalletByLevel);
           console.log(`   📋 Client Level: ${clientLevel} (max wallet: ${maxWalletByLevel}€, effective: ${effectiveDisplay}€)`);
-          console.log(`   🧮 Calculation: floor((0.5 × ${effectiveDisplay}) / ${marginPerContract}) = ${calculatedContracts}`);
+          console.log(`   🧮 Calculation: floor((0.45 × ${effectiveDisplay}) / ${marginPerContract}) = ${calculatedContracts}`);
         } else {
           console.log(`   📋 Account type: ${accountType || 'DEMO'} (no wallet cap)`);
-          console.log(`   🧮 Calculation: floor((0.5 × ${cashBalance.amount}) / ${marginPerContract}) = ${calculatedContracts}`);
+          console.log(`   🧮 Calculation: floor((0.45 × ${cashBalance.amount}) / ${marginPerContract}) = ${calculatedContracts}`);
         }
         console.log(`   💰 Margin per contract: ${marginPerContract} ${cashBalance.currency} (${marginSource})`);
         console.log(`   ✅ Final contracts: ${numberOfContracts}`);
@@ -1030,13 +1022,10 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
 
       // Verify selector panel is actually open before proceeding
       console.log('🔍 Verifying selector panel opened...');
-      const selectorPanelVisible = await page.locator('input[type="text"], input[type="search"], .search input').first().isVisible({ timeout: 5000 }).catch(() => false);
+      const selectorPanelVisible = await page.locator('input[type="search"]:visible, input[placeholder*="search" i]:visible, input[placeholder*="cerca" i]:visible, .search input:visible, [class*="search"] input:visible').first().isVisible({ timeout: 5000 }).catch(() => false);
       if (!selectorPanelVisible) {
         console.log('⚠️  Selector panel not detected, taking screenshot for debug...');
         await page.screenshot({ path: getScreenshotPath('debug-selector-not-open.png'), fullPage: true });
-        // Try one more time with a different approach
-        await page.keyboard.press('Control+F').catch(() => {});
-        await page.waitForTimeout(1000);
       }
 
       // Find and fill search box - with retry logic and multiple strategies
@@ -1047,19 +1036,17 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
         try {
           // Try multiple search box selectors
           const searchSelectors = [
-            'input[type="text"]',
-            'input[type="search"]',
-            'input[placeholder*="search" i]',
-            'input[placeholder*="cerca" i]',
-            '.search input',
-            '[class*="search"] input',
-            'input'
+            'input[type="search"]:visible',
+            'input[placeholder*="search" i]:visible',
+            'input[placeholder*="cerca" i]:visible',
+            '.search input:visible',
+            '[class*="search"] input:visible'
           ];
           
           let searchBox = null;
           for (const selector of searchSelectors) {
             try {
-              const box = page.locator(selector).filter({ visible: true }).first();
+              const box = page.locator(selector).first();
               if (await box.count() > 0) {
                 searchBox = box;
                 console.log(`   Found search box with selector: ${selector}`);
@@ -1069,9 +1056,9 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
           }
           
           if (searchBox) {
-            await searchBox.click({ timeout: 2000 });
-            await page.waitForTimeout(300);
-            await searchBox.fill('US500CASH');
+            // fill() does not require a pointer click, so decorative icons cannot
+            // intercept the action as happened with the previous implementation.
+            await searchBox.fill('US500CASH', { timeout: 3000 });
             await page.waitForTimeout(500);
             console.log('✓ Typed US500CASH in search');
             searchSuccess = true;
@@ -1414,7 +1401,7 @@ test('Trade US500CASH with PUT option', async ({ page }) => {
             // Recalculate contracts with real balance now that we have it
             const tradeMarginLate = parseFloat(process.env.TRADE_MARGIN) || null;
             if (tradeMarginLate && tradeMarginLate > 0) {
-              const recalc = Math.floor((0.5 * num) / tradeMarginLate);
+              const recalc = Math.floor((0.45 * num) / tradeMarginLate);
               const corrected = Math.max(1, Math.min(recalc, 10));
               console.log(`   🔄 Recalculated contracts: ${corrected} (was: ${numberOfContracts})`);
               numberOfContracts = corrected;
